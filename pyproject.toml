@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.24.2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyoco-server"
+version = "0.4.0"
+description = "Distributed execution backend for Pyoco using NATS"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.110.0",
+    "httpx>=0.27.0",
+    "nats-py>=2.12.0",
+    "pydantic>=2.0.0",
+    "pyoco>=0.6.1",
+    "PyYAML>=6.0.0",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.27.0",
+]
+
+[dependency-groups]
+dev = [
+    "nats-bootstrap>=0.0.9",
+    "nats-server>=0.0.0",
+    "nats-server-bin>=0.0.0",
+    "pytest>=9.0.2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyoco_server"]
