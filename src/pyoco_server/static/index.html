@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pyoco Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <header class="topbar">
+      <div>
+        <h1>Pyoco Control Deck</h1>
+        <p class="subtitle" data-i18n="header.subtitle">One playful control room for runs, workers, and metrics.</p>
+        <p class="subtitle mood" data-i18n="header.mood">CUTE mode spirit: serious ops, joyful feedback.</p>
+      </div>
+      <div class="auth-box">
+        <label>
+          <span data-i18n="auth.header">Header</span>
+          <input id="apiHeader" type="text" value="X-API-Key" />
+        </label>
+        <label>
+          <span data-i18n="auth.api_key">API Key</span>
+          <input id="apiKey" type="password" placeholder="optional" data-i18n-placeholder="auth.api_key_placeholder" />
+        </label>
+        <button id="saveAuth" data-i18n="auth.apply">Apply</button>
+      </div>
+    </header>
+
+    <main class="grid">
+      <section class="panel" id="runsPanel">
+        <div class="panel-head">
+          <h2 data-i18n="runs.title">Runs</h2>
+        </div>
+        <form class="filters" id="runsFilters">
+          <label>
+            <span data-i18n="runs.filter.status">Status</span>
+            <select id="fStatus">
+              <option value="" data-i18n="common.all">ALL</option>
+              <option value="PENDING" data-i18n="status.pending_code">PENDING</option>
+              <option value="RUNNING" data-i18n="status.running_code">RUNNING</option>
+              <option value="CANCELLING" data-i18n="status.cancelling_code">CANCELLING</option>
+              <option value="COMPLETED" data-i18n="status.completed_code">COMPLETED</option>
+              <option value="FAILED" data-i18n="status.failed_code">FAILED</option>
+              <option value="CANCELLED" data-i18n="status.cancelled_code">CANCELLED</option>
+            </select>
+          </label>
+          <label>
+            <span data-i18n="runs.filter.flow_name">flow_name</span>
+            <input id="fFlow" type="text" placeholder="main" data-i18n-placeholder="runs.filter.flow_placeholder" />
+          </label>
+          <label>
+            <span data-i18n="runs.filter.tag">Tag</span>
+            <input id="fTag" type="text" placeholder="default" data-i18n-placeholder="runs.filter.tag_placeholder" />
+          </label>
+          <label>
+            <span data-i18n="runs.filter.run_id">run_id</span>
+            <input id="fRunId" type="text" placeholder="partial match" data-i18n-placeholder="common.partial_match" />
+          </label>
+          <label>
+            <span data-i18n="runs.filter.sort_by">Sort by</span>
+            <select id="fSortKey">
+              <option value="ops_default" data-i18n="runs.sort.ops_default">ops_default (RUNNING > FAILED > COMPLETED)</option>
+              <option value="updated_at" data-i18n="runs.sort.updated_at">updated_at</option>
+              <option value="start_time" data-i18n="runs.sort.start_time">start_time (実行開始)</option>
+              <option value="end_time" data-i18n="runs.sort.end_time">end_time (実行完了)</option>
+              <option value="flow_name" data-i18n="runs.sort.flow_name">flow_name</option>
+              <option value="status" data-i18n="runs.sort.status">status</option>
+              <option value="run_id" data-i18n="runs.sort.run_id">run_id</option>
+            </select>
+          </label>
+          <label>
+            <span data-i18n="runs.filter.order">Order</span>
+            <select id="fSortDir">
+              <option value="desc" data-i18n="runs.order.desc">desc</option>
+              <option value="asc" data-i18n="runs.order.asc">asc</option>
+            </select>
+          </label>
+          <label>
+            <span data-i18n="runs.filter.worker_id">worker_id</span>
+            <input id="fWorkerId" type="text" placeholder="partial match" data-i18n-placeholder="common.partial_match" />
+          </label>
+          <label>
+            <span data-i18n="runs.filter.limit">Limit</span>
+            <input id="fLimit" type="number" min="1" max="200" value="50" />
+          </label>
+          <button type="submit" data-i18n="runs.filter.apply">Apply Filters</button>
+        </form>
+        <div class="meta glossary-hint" data-i18n="runs.glossary">flow_name = workflow name / tag = route label</div>
+        <div id="runStats" class="run-stats" aria-live="polite">
+          <span class="stat-chip all" data-i18n="stats.all_initial">◉ All 0</span>
+          <span class="stat-chip running" data-i18n="stats.running_initial">▶ Running 0</span>
+          <span class="stat-chip completed" data-i18n="stats.completed_initial">✓ Completed 0</span>
+          <span class="stat-chip failed" data-i18n="stats.failed_initial">⚠ Failed 0</span>
+        </div>
+        <div id="runsMeta" class="meta"></div>
+        <ul id="runsList" class="runs-list"></ul>
+      </section>
+
+      <section class="panel" id="detailPanel">
+        <div class="panel-head">
+          <h2 data-i18n="detail.title">Run Detail</h2>
+          <button id="detailCancel" type="button" data-i18n="detail.cancel">Cancel</button>
+          <span id="watchState" class="badge">idle</span>
+        </div>
+        <div id="detailMeta" class="meta" data-i18n="detail.unselected">Run is not selected.</div>
+        <div class="detail-split">
+          <article class="detail-card">
+            <h3 data-i18n="detail.execution_story">Execution Story</h3>
+            <pre id="detailJson" class="code" data-i18n="detail.unselected">Run is not selected.</pre>
+          </article>
+          <article class="detail-card">
+            <h3 data-i18n="detail.flow_recipe">Flow Recipe</h3>
+            <pre id="detailFlowJson" class="code" data-i18n="detail.unselected">Run is not selected.</pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="panel stack" id="opsPanel">
+        <article>
+          <div class="panel-head">
+            <h2 data-i18n="workers.title">Workers</h2>
+          </div>
+          <form class="workers-filters" id="workersFilters">
+            <label>
+              <span data-i18n="workers.filter.state">State</span>
+              <select id="wState">
+                <option value="" data-i18n="common.all">ALL</option>
+                <option value="RUNNING" data-i18n="status.running_code">RUNNING</option>
+                <option value="IDLE" data-i18n="status.idle_code">IDLE</option>
+                <option value="STOPPED_GRACEFUL" data-i18n="status.stopped_graceful_code">STOPPED_GRACEFUL</option>
+                <option value="DISCONNECTED" data-i18n="status.disconnected_code">DISCONNECTED</option>
+              </select>
+            </label>
+            <label class="checkbox-inline">
+              <input id="wIncludeHidden" type="checkbox" />
+              <span data-i18n="workers.filter.include_hidden">include_hidden</span>
+            </label>
+          </form>
+          <ul id="workersList" class="workers-list"></ul>
+        </article>
+        <article>
+          <div class="panel-head">
+            <h2 data-i18n="metrics.title">Metrics</h2>
+          </div>
+          <div class="metrics-kpi-grid">
+            <section class="kpi-card running">
+              <small data-i18n="metrics.running">Engines running</small>
+              <strong id="kpiRunning">-</strong>
+            </section>
+            <section class="kpi-card completed">
+              <small data-i18n="metrics.completed_today">Today's wins</small>
+              <strong id="kpiCompletedToday">-</strong>
+            </section>
+            <section class="kpi-card failed">
+              <small data-i18n="metrics.failed_today">Today's retries</small>
+              <strong id="kpiFailedToday">-</strong>
+            </section>
+          </div>
+          <div class="metrics-reset-row">
+            <button id="clearMetricsBase" type="button" data-i18n="metrics.reset">RESET COUNTER</button>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span id="lastUpdate" data-i18n="footer.last_update_initial">Last update: -</span>
+      <span id="errorLine" class="error"></span>
+    </footer>
+
+    <script>
+      window.__PYOCO_DASHBOARD_LANG__ = "__PYOCO_DASHBOARD_LANG_VALUE__";
+    </script>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

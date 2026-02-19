@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from nats.js import api
-from nats.js.errors import NotFoundError
+from nats.js.errors import BucketNotFoundError, NotFoundError
 
 from .config import NatsBackendConfig
 
@@ -65,3 +65,24 @@ async def ensure_resources(js, config: NatsBackendConfig) -> None:
         await js.key_value(config.auth_kv_bucket)
     except NotFoundError:
         await js.create_key_value(api.KeyValueConfig(bucket=config.auth_kv_bucket, history=1))
+
+    # Object Store bucket (wheel registry)
+    try:
+        await js.object_store(config.wheel_object_store_bucket)
+    except (NotFoundError, BucketNotFoundError):
+        await js.create_object_store(
+            bucket=str(config.wheel_object_store_bucket),
+            max_bytes=int(config.wheel_max_bytes),
+        )
+
+    # KV bucket (wheel distribution history / audit trail)
+    try:
+        await js.key_value(config.wheel_history_kv_bucket)
+    except NotFoundError:
+        await js.create_key_value(
+            api.KeyValueConfig(
+                bucket=config.wheel_history_kv_bucket,
+                history=1,
+                ttl=float(config.wheel_history_ttl_sec),
+            )
+        )

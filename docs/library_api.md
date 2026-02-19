@@ -47,6 +47,9 @@ HTTP Gateway の app factory は以下です。
 - `ack_progress_interval_sec`
 - `dlq_stream`, `dlq_subject_prefix`, `dlq_publish_execution_error`
 - `max_run_snapshot_bytes`
+- `wheel_object_store_bucket`, `wheel_sync_enabled`, `wheel_sync_dir`, `wheel_sync_interval_sec`
+- `wheel_install_timeout_sec`, `wheel_max_bytes`
+- `wheel_history_kv_bucket`, `wheel_history_ttl_sec`
 - `workflow_yaml_max_bytes`
 
 env からの生成：
@@ -64,7 +67,9 @@ env からの生成：
   - Work stream（`PYOCO_WORK`）
   - runスナップショットKV（`pyoco_runs`）
   - worker生死KV（`pyoco_workers`）
+  - 認証KV（`pyoco_auth`）
   - DLQ stream（`PYOCO_DLQ`）
+  - wheel Object Store（`pyoco_wheels`）
 
 ## PyocoNatsWorker
 パス：`src/pyoco_server/worker.py`
@@ -100,6 +105,13 @@ flow_resolver 契約：
 - worker は最新スナップショットをKVへ書きます。
 - `config.max_run_snapshot_bytes` を超える場合、`task_records` を落として `task_records_truncated=true` を立てることがあります（tasksは保持）。
 
+wheel同期（opt-in）：
+- `config.wheel_sync_enabled=True` の場合、worker は wheel registry（Object Store）を同期します。
+- 同期タイミングは「起動時」と「`run_once` の次回poll前」です。
+- 実行中runの途中で wheel 更新は開始しません。
+- worker tags と wheel tags が1つ以上一致したものだけ同期し、wheel tags が空なら全worker対象です。
+- 同一パッケージに複数バージョンがある場合は、最新版のみ同期/インストールします。
+
 ## PyocoNatsClient
 パス：`src/pyoco_server/client.py`
 
@@ -131,6 +143,22 @@ API：
 - `client.get_run_with_records(run_id) -> dict`（`include=records`）
 - `client.get_tasks(run_id) -> dict`
 - `client.list_runs(status=..., flow=..., tag=..., full=False, limit=...) -> list[dict]`
+- `client.list_runs_vnext(status=..., flow=..., tag=..., full=False, limit=..., updated_after=..., cursor=..., workflow_yaml_sha256=...) -> dict`
+  - 差分取得形式（`items` + `next_cursor`）で一覧更新を扱います。
+- `client.watch_run(run_id, include_records=False, since=..., timeout_sec=...) -> generator`
+  - SSE（`/runs/{run_id}/watch`）を購読し、`{"event": ..., "data": ...}` を順次返します。
+- `client.cancel_run(run_id, wait=False, timeout_sec=...) -> dict`
+- `client.get_workers(scope=..., state=..., include_hidden=..., limit=...) -> list[dict]`
+  - worker運用一覧（`GET /workers`）を取得します。
+  - 既定は `scope=active` / `include_hidden=false` です（HTTP側の既定）。
+  - `wheel_sync`（enabled/last_result/counts/installed_wheels/skipped_incompatible）を含み、配布結果の可視化に利用できます。
+- `client.patch_worker_hidden(worker_id, hidden=...) -> dict`
+  - worker表示制御（`PATCH /workers/{worker_id}`）を行います。
+- `client.list_wheels() -> list[dict]`
+- `client.list_wheel_history(limit=..., wheel_name=..., action=...) -> list[dict]`
+- `client.upload_wheel(filename=..., data=..., replace=True, tags=[...]) -> dict`
+  - 同一パッケージはバージョンを必ず上げて登録する必要があります（同一/過去バージョンはHTTP 409）。
+- `client.delete_wheel(wheel_name) -> dict`
 - `client.close()`
 
 ## HTTP Gateway app factory
@@ -142,6 +170,9 @@ API：
 - gateway は env vars を読み取り `NatsBackendConfig` を構築します。
 - env var 一覧と on-wire 契約は `docs/spec.md` を参照してください。
   - 認証（opt-in）：`PYOCO_HTTP_AUTH_MODE=api_key` の場合、`X-API-Key` を要求します。
+- gateway は運用向けDashboard UIを静的配信します（`GET /` / `GET /static/*`）。
+- gateway は wheel registry API（`GET/POST /wheels`, `GET/DELETE /wheels/{wheel_name}`）を提供します。
+- gateway は wheel配布履歴 API（`GET /wheels/history`）を提供します。
 
 ログ：
 - HTTP Gateway / worker（呼び出し側）は `PYOCO_LOG_*` の設定を読み取り、stdoutへログを出力できます。
@@ -151,3 +182,37 @@ API：
 ## 運用CLI（API key 管理）
 Phase 3（v0.3 opt-in）では、API key 管理用に `python -m pyoco_server.admin_cli ...` を提供します。  
 詳細は `docs/architecture.md` と `docs/spec.md`（REQ-0016/0017）を参照してください。
+
+## 実行CLI（server/worker/client）
+`pyproject.toml` の scripts として次を提供します。
+
+- `pyoco-server`（`pyoco_server.server_cli:main`）
+- `pyoco-worker`（`pyoco_server.worker_cli:main`）
+- `pyoco-client`（`pyoco_server.client_cli:main`）
+- `pyoco-server-admin`（`pyoco_server.admin_cli:main`）
+
+`pyoco-server` のCLI補足（v0.4）：
+- 既定サブコマンドは `up`（後方互換で旧フラット引数も受理）。
+- `up --with-nats-bootstrap` を指定すると、`nats-bootstrap up -- -js ...` で単体NATSを同時起動できます。
+- 同時起動時は `PYOCO_NATS_URL` を `nats://<listen_host>:<client_port>` に固定し、`--nats-url` が不一致ならエラー終了します。
+
+`pyoco-client` のCLI補足（v0.4）：
+- `submit` は params 入力を3形式で受け付けます（後勝ち）。
+  - `--params-file`（JSON/YAML object）
+  - `--params`（JSON object）
+  - `--param key=value`（複数回指定可）
+- `list` / `list-vnext` は `--output json|table` をサポートします。
+- `watch` は `--output json|status` をサポートします。
+- wheel配布は `wheels` / `wheel-upload` / `wheel-delete` をサポートします。
+- 履歴参照は `wheel-history` をサポートします。
+- `wheel-upload --wheel-file <path> [--tags cpu,linux] [--replace|--no-replace]`
+- `wheel-upload` は同一パッケージでバージョンを必ず上げてください（同一/過去バージョンは409）。
+- 利用者が修正可能な失敗は exit code `1` で終了し、stderr に修正例を表示します。
+- `workers` は現状、既定条件での一覧取得（`GET /workers`）を実行します。`scope/state/include_hidden` や hide/unhide は `PyocoHttpClient` または直接HTTP APIを利用してください。
+
+`pyoco-worker` のCLI補足（v0.4）：
+- wheel同期設定をCLIで上書きできます。
+  - `--wheel-sync` / `--no-wheel-sync`
+  - `--wheel-sync-dir`
+  - `--wheel-sync-interval-sec`
+  - `--wheel-install-timeout-sec`

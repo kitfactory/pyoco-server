@@ -13,6 +13,7 @@
 - tagマッチは OR のみです（ANDはしません）。
 - ワーカーは「自分が処理できるtag」を引き受けるだけで、GPU/CPUの“実際の能力判定”はここでは扱いません。
   - 実運用では「GPUが載っているマシンだけ `--tags gpu` で起動」など、起動時に宣言して運用します。
+- wheel配布もタグ一致で制御できます（wheel tags と worker tags の共通要素がある場合だけ同期）。
 
 ---
 
@@ -99,7 +100,13 @@ set +a
 
 ```bash
 export PYOCO_NATS_URL="nats://127.0.0.1:4222"
-uv run uvicorn pyoco_server.http_api:create_app --factory --host 127.0.0.1 --port 8000
+uv run pyoco-server up --host 127.0.0.1 --port 8000
+```
+
+単体NATSでよければ、次のように同時起動もできます（`nats-bootstrap` 必須）。
+
+```bash
+uv run pyoco-server up --with-nats-bootstrap --host 127.0.0.1 --port 8000
 ```
 
 ### （任意）HTTP認証（API key）を有効化する
@@ -129,119 +136,166 @@ curl -sS http://127.0.0.1:8000/health
 
 ---
 
-## 5) CPUワーカーとGPUワーカーを起動する
+## 5) CPUワーカーとGPUワーカーを起動する（YAMLメイン）
 
-このリポジトリの例では、`examples/run_worker.py` が「ワーカー実行」を担います。
 ワーカーは `--tags` で「自分が処理するtag」を宣言します（複数指定はカンマ区切り、OR）。
+YAMLジョブ（`submit-yaml`）を主に使う場合、`--flow-resolver` は不要です。
+
+このチュートリアルでは wheel同期の挙動も見るため、先に次を設定します。
+
+```bash
+export PYOCO_WHEEL_SYNC_ENABLED="1"
+export PYOCO_WHEEL_SYNC_DIR=".pyoco/wheels"
+```
 
 ### CPUワーカー（tag=cpu）
 ターミナルC：
 
 ```bash
-uv run python examples/run_worker.py --nats-url nats://127.0.0.1:4222 --tags cpu --worker-id cpu-1
+uv run pyoco-worker --nats-url nats://127.0.0.1:4222 --tags cpu --worker-id cpu-1 --wheel-sync
 ```
 
 ### GPUワーカー（tag=gpu）
 ターミナルD：
 
 ```bash
-uv run python examples/run_worker.py --nats-url nats://127.0.0.1:4222 --tags gpu --worker-id gpu-1
+uv run pyoco-worker --nats-url nats://127.0.0.1:4222 --tags gpu --worker-id gpu-1 --wheel-sync
 ```
+
+補足：`submit`（flow_name投入）も使う場合は、`--flow-resolver examples/hello_flow.py:resolve_flow` を付けて起動してください。
 
 ---
 
-## 6) CPU向けrunとGPU向けrunを投入する（ルーティングを体験）
+## 6) YAMLでCPU向けrunとGPU向けrunを投入する（推奨）
 
 投入はHTTPです。tagを変えると「どのワーカーが拾うか」が変わります。
+まず `flow.yaml` を作ります（このチュートリアルでは package 同梱のテスト用タスクを使います）。
+
+```bash
+cat > flow.yaml <<'YAML'
+version: 1
+flow:
+  graph: |
+    add_one >> to_text
+  defaults:
+    x: 1
+tasks:
+  add_one:
+    callable: pyoco_server._workflow_test_tasks:add_one
+  to_text:
+    callable: pyoco_server._workflow_test_tasks:to_text
+YAML
+```
 
 ### CPUに投げる（tag=cpu）
 ターミナルE：
 
 ```bash
-uv run python examples/submit_run.py --server http://127.0.0.1:8000 --tag cpu
+uv run pyoco-client --server http://127.0.0.1:8000 submit-yaml --workflow-file flow.yaml --flow-name main --tag cpu
 ```
 
 （HTTP認証を有効にした場合）
 ```bash
-uv run python examples/submit_run.py --server http://127.0.0.1:8000 --tag cpu --api-key "<your_api_key>"
+uv run pyoco-client --server http://127.0.0.1:8000 --api-key "<your_api_key>" submit-yaml --workflow-file flow.yaml --flow-name main --tag cpu
 ```
 
 ### GPUに投げる（tag=gpu）
 ターミナルE（もう一度）：
 
 ```bash
-uv run python examples/submit_run.py --server http://127.0.0.1:8000 --tag gpu
+uv run pyoco-client --server http://127.0.0.1:8000 submit-yaml --workflow-file flow.yaml --flow-name main --tag gpu
 ```
 
 （HTTP認証を有効にした場合）
 ```bash
-uv run python examples/submit_run.py --server http://127.0.0.1:8000 --tag gpu --api-key "<your_api_key>"
+uv run pyoco-client --server http://127.0.0.1:8000 --api-key "<your_api_key>" submit-yaml --workflow-file flow.yaml --flow-name main --tag gpu
 ```
 
 観察ポイント（「おもしろいところ」）：
 - CPUのrunはCPUワーカーが拾い、GPUのrunはGPUワーカーが拾う
 - `GET /runs/{run_id}` のレスポンスに `worker_id` が入り、どのワーカーが処理したか見える
 
-run_id は `examples/submit_run.py` の出力に表示されます。
+run_id は `pyoco-client` のJSON出力に表示されます。
 
 例：runの状態を見る
 
 ```bash
-curl -sS http://127.0.0.1:8000/runs/<run_id>
+uv run pyoco-client --server http://127.0.0.1:8000 get <run_id>
+uv run pyoco-client --server http://127.0.0.1:8000 watch <run_id> --until-terminal --output status
+uv run pyoco-client --server http://127.0.0.1:8000 list --tag cpu --limit 20 --output table
 ```
 
-### 6b) （任意）YAML（flow.yaml）をそのまま投入する（Phase 4）
-信頼できる社内チーム向けとして、`flow.yaml`（YAML）をそのまま投入できます。
+`submit`（flow_name投入）を使う場合の params 指定は、`--params-file` / `--params` / `--param key=value` を併用できます（後勝ち）。
 
-ポイント：
-- `flow.yaml` は **単体flow**（top-level `flow:`）です（pyoco 0.6.1）。
-- `flow.yaml` に `discovery` は書けません。利用可能なタスクは worker 側の環境で決まります。
+---
 
-例（`flow.yaml`）：
-```yaml
-version: 1
-flow:
-  graph: |
-    task_a >> task_b
-  defaults:
-    x: 1
-tasks:
-  task_a:
-    callable: your_pkg.tasks:task_a
-  task_b:
-    callable: your_pkg.tasks:task_b
-```
+## 6b) wheel をタグ付きで配布する（CPU/GPUで出し分け）
 
-投入（tagでルーティングします）：
+運用者は wheel registry（`/wheels`）に配布物を登録できます。  
+worker は自分の `--tags` と一致する wheel だけ同期します。
+
 ```bash
-curl -sS \\
-  -F "flow_name=main" \\
-  -F "tag=cpu" \\
-  -F "workflow=@flow.yaml;type=application/x-yaml" \\
-  http://127.0.0.1:8000/runs/yaml
+uv run pyoco-client --server http://127.0.0.1:8000 wheel-upload --wheel-file dist/task_cpu-0.1.0-py3-none-any.whl --tags cpu
+uv run pyoco-client --server http://127.0.0.1:8000 wheel-upload --wheel-file dist/task_gpu-0.1.0-py3-none-any.whl --tags gpu
+uv run pyoco-client --server http://127.0.0.1:8000 wheel-upload --wheel-file dist/task_shared-0.1.0-py3-none-any.whl
+uv run pyoco-client --server http://127.0.0.1:8000 wheels
+uv run pyoco-client --server http://127.0.0.1:8000 wheel-history --limit 20
 ```
 
-（HTTP認証を有効にした場合）
-```bash
-curl -sS \\
-  -H "X-API-Key: <your_api_key>" \\
-  -F "flow_name=main" \\
-  -F "tag=cpu" \\
-  -F "workflow=@flow.yaml;type=application/x-yaml" \\
-  http://127.0.0.1:8000/runs/yaml
-```
+観察ポイント：
+- CPU worker は `cpu` + 共有wheelを同期する
+- GPU worker は `gpu` + 共有wheelを同期する
+- 同一パッケージに複数バージョンがある場合、各workerは最新版のみを同期する
+- 同期は起動時と次回poll前に行われ、実行中runの途中更新はしない
+- 同一パッケージの再配布はバージョンアップが必須（同一/過去バージョンは409）
 
 ---
 
 ## 7) 運用向けエンドポイント（/metrics と /workers）を見る
 
-### /workers（いま生きているワーカー一覧）
+### /workers（worker運用一覧）
 
 ```bash
 curl -sS http://127.0.0.1:8000/workers
 ```
 
-ここに `cpu-1` / `gpu-1` が出ていれば、TTL-KVが更新されています。
+既定では `scope=active` なので、`RUNNING|IDLE` のみ表示されます。  
+全件表示（hidden含む）は次です。
+
+```bash
+curl -sS "http://127.0.0.1:8000/workers?scope=all&include_hidden=true"
+```
+
+状態で絞り込む例：
+
+```bash
+curl -sS "http://127.0.0.1:8000/workers?scope=all&state=STOPPED_GRACEFUL"
+curl -sS "http://127.0.0.1:8000/workers?scope=all&state=DISCONNECTED"
+```
+
+表示制御（hidden）の例：
+
+```bash
+# hidden=true（一覧から隠す）
+curl -sS -X PATCH "http://127.0.0.1:8000/workers/cpu-1" \
+  -H "Content-Type: application/json" \
+  -d '{"hidden": true}'
+
+# hidden=false（再表示）
+curl -sS -X PATCH "http://127.0.0.1:8000/workers/cpu-1" \
+  -H "Content-Type: application/json" \
+  -d '{"hidden": false}'
+```
+
+状態の見方：
+- `RUNNING`：run実行中
+- `IDLE`：起動中だが実行していない
+- `STOPPED_GRACEFUL`：Ctrl+C などで正常停止した
+- `DISCONNECTED`：異常停止や通信断などで heartbeat が途絶した
+
+補足：
+- `DISCONNECTED` 判定は `PYOCO_WORKER_DISCONNECT_TIMEOUT_SEC`（既定20秒）を超えたときに行われます。
+- `STOPPED_GRACEFUL` と `DISCONNECTED` は別状態として区別されます。
 
 ### /metrics（Prometheus互換のメトリクス：best-effort）
 
@@ -250,6 +304,10 @@ curl -sS http://127.0.0.1:8000/metrics | head
 ```
 
 `pyoco_runs_total{status="COMPLETED"}` や `pyoco_workers_alive_total` が増えていきます。
+
+### Dashboard UI（read-only）
+ブラウザで `http://127.0.0.1:8000/` を開くと、run一覧/詳細、workers、metrics を1画面で確認できます。  
+Auth有効時は、画面右上に `X-API-Key` を入力して適用します。
 
 ---
 

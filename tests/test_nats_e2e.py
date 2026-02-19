@@ -616,6 +616,85 @@ def test_long_task_heartbeat_and_running_visibility():
             proc.wait(timeout=5)
 
 
+def test_http_gateway_dashboard_static_assets_served():
+    nats_server = shutil.which("nats-server")
+    assert nats_server, "nats-server not found (expected via nats-server-bin)"
+
+    nats_port = _free_port()
+    mon_port = _free_port()
+    api_port = _free_port()
+
+    with tempfile.TemporaryDirectory() as store_dir:
+        nats_proc = subprocess.Popen(
+            [
+                nats_server,
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(nats_port),
+                "-m",
+                str(mon_port),
+                "-sd",
+                store_dir,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_proc = None
+        try:
+            _wait_tcp("127.0.0.1", nats_port, timeout=10.0)
+
+            env = dict(os.environ)
+            env["PYOCO_NATS_URL"] = f"nats://127.0.0.1:{nats_port}"
+
+            api_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "pyoco_server.http_api:create_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(api_port),
+                    "--log-level",
+                    "warning",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            base_url = f"http://127.0.0.1:{api_port}"
+            _wait_http(f"{base_url}/health", timeout=15.0)
+
+            import httpx
+
+            root = httpx.get(f"{base_url}/", timeout=5.0)
+            assert root.status_code == 200
+            assert "text/html" in (root.headers.get("content-type") or "")
+            assert "Pyoco Control Deck" in root.text
+            assert "/static/app.js" in root.text
+            assert 'name="viewport"' in root.text
+
+            js = httpx.get(f"{base_url}/static/app.js", timeout=5.0)
+            assert js.status_code == 200
+            assert "refreshRunsDelta" in js.text
+
+            css = httpx.get(f"{base_url}/static/styles.css", timeout=5.0)
+            assert css.status_code == 200
+            assert "--accent" in css.text
+            assert "@media (max-width: 1100px)" in css.text
+        finally:
+            if api_proc is not None:
+                api_proc.terminate()
+                api_proc.wait(timeout=5)
+            nats_proc.terminate()
+            nats_proc.wait(timeout=5)
+
+
 def test_http_gateway_e2e_submit_list_and_task_status():
     nats_server = shutil.which("nats-server")
     assert nats_server, "nats-server not found (expected via nats-server-bin)"
@@ -755,6 +834,301 @@ def test_http_gateway_e2e_submit_list_and_task_status():
             nats_proc.wait(timeout=5)
 
 
+def test_http_gateway_cancel_run_transitions_to_cancelled_and_idempotent():
+    nats_server = shutil.which("nats-server")
+    assert nats_server, "nats-server not found (expected via nats-server-bin)"
+
+    nats_port = _free_port()
+    mon_port = _free_port()
+    api_port = _free_port()
+
+    with tempfile.TemporaryDirectory() as store_dir:
+        nats_proc = subprocess.Popen(
+            [
+                nats_server,
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(nats_port),
+                "-m",
+                str(mon_port),
+                "-sd",
+                store_dir,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_proc = None
+        try:
+            _wait_tcp("127.0.0.1", nats_port, timeout=10.0)
+
+            env = dict(os.environ)
+            env["PYOCO_NATS_URL"] = f"nats://127.0.0.1:{nats_port}"
+            env["PYOCO_RUN_HEARTBEAT_INTERVAL_SEC"] = "0.1"
+            env["PYOCO_WORKER_HEARTBEAT_INTERVAL_SEC"] = "0.1"
+            env["PYOCO_CANCEL_GRACE_PERIOD_SEC"] = "0.3"
+
+            api_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "pyoco_server.http_api:create_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(api_port),
+                    "--log-level",
+                    "warning",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            base_url = f"http://127.0.0.1:{api_port}"
+            _wait_http(f"{base_url}/health", timeout=15.0)
+
+            cfg = NatsBackendConfig(
+                nats_url=env["PYOCO_NATS_URL"],
+                run_heartbeat_interval_sec=0.1,
+                worker_heartbeat_interval_sec=0.1,
+                cancel_grace_period_sec=0.3,
+            )
+
+            @pyoco.task
+            def slow():
+                time.sleep(1.4)
+                return "slow"
+
+            @pyoco.task
+            def after(ctx):
+                return f"after:{ctx.results.get('slow')}"
+
+            flow = pyoco.Flow(name="main")
+            flow.add_task(slow.task)
+            flow.add_task(after.task)
+            after.task.dependencies.add(slow.task)
+            slow.task.dependents.add(after.task)
+
+            def resolve_flow(name: str) -> pyoco.Flow:
+                assert name == "main"
+                return flow
+
+            client = PyocoHttpClient(base_url)
+            try:
+                run_tag = "cancel-http"
+                submitted = client.submit_run("main", params={"x": 1}, tag=run_tag, tags=[run_tag])
+                run_id = submitted["run_id"]
+
+                def worker_thread() -> None:
+                    async def run_worker_once() -> None:
+                        worker = await PyocoNatsWorker.connect(
+                            config=cfg,
+                            flow_resolver=resolve_flow,
+                            worker_id="w-cancel-http",
+                            tags=[run_tag],
+                        )
+                        try:
+                            processed = await worker.run_once(timeout=20.0)
+                            assert processed == run_id
+                        finally:
+                            await worker.close()
+
+                    asyncio.run(run_worker_once())
+
+                t = threading.Thread(target=worker_thread, daemon=True)
+                t.start()
+
+                import httpx
+
+                deadline = time.time() + 10.0
+                while time.time() < deadline:
+                    snap = client.get_run(run_id)
+                    if str(snap.get("status") or "").upper() in {"PENDING", "RUNNING"}:
+                        break
+                    time.sleep(0.05)
+
+                cancel1 = httpx.post(f"{base_url}/runs/{run_id}/cancel", timeout=5.0)
+                assert cancel1.status_code == 200
+                body1 = cancel1.json()
+                assert body1["run_id"] == run_id
+                assert body1["status"] in {"CANCELLING", "CANCELLED"}
+                cancel_requested_at = float(body1.get("cancel_requested_at") or 0.0)
+                assert cancel_requested_at > 0.0
+
+                cancel2 = httpx.post(f"{base_url}/runs/{run_id}/cancel", timeout=5.0)
+                assert cancel2.status_code == 200
+                body2 = cancel2.json()
+                assert body2["run_id"] == run_id
+                assert body2["status"] in {"CANCELLING", "CANCELLED"}
+                assert float(body2.get("cancel_requested_at") or 0.0) > 0.0
+
+                deadline = time.time() + 10.0
+                snap = None
+                saw_cancelling_after_grace = False
+                while time.time() < deadline:
+                    snap = client.get_run(run_id)
+                    status = str(snap.get("status") or "").upper()
+                    if status == "CANCELLING" and (time.time() - cancel_requested_at) >= 0.3:
+                        saw_cancelling_after_grace = True
+                    if snap.get("status") in {"COMPLETED", "FAILED", "CANCELLED"}:
+                        break
+                    time.sleep(0.05)
+                assert snap is not None
+                assert saw_cancelling_after_grace
+                assert snap["status"] == "CANCELLED"
+                assert float(snap.get("cancel_requested_at") or 0.0) > 0.0
+
+                t.join(timeout=20.0)
+                assert not t.is_alive(), "worker thread did not finish"
+
+                cancel3 = httpx.post(f"{base_url}/runs/{run_id}/cancel", timeout=5.0)
+                assert cancel3.status_code == 200
+                body3 = cancel3.json()
+                assert body3["run_id"] == run_id
+                assert body3["status"] == "CANCELLED"
+            finally:
+                client.close()
+        finally:
+            if api_proc is not None:
+                api_proc.terminate()
+                api_proc.wait(timeout=5)
+            nats_proc.terminate()
+            nats_proc.wait(timeout=5)
+
+
+def test_http_gateway_cancel_requires_auth_and_hides_cross_tenant():
+    nats_server = shutil.which("nats-server")
+    assert nats_server, "nats-server not found (expected via nats-server-bin)"
+
+    nats_port = _free_port()
+    mon_port = _free_port()
+    api_port = _free_port()
+
+    with tempfile.TemporaryDirectory() as store_dir:
+        nats_proc = subprocess.Popen(
+            [
+                nats_server,
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(nats_port),
+                "-m",
+                str(mon_port),
+                "-sd",
+                store_dir,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_proc = None
+        try:
+            _wait_tcp("127.0.0.1", nats_port, timeout=10.0)
+
+            env = dict(os.environ)
+            env["PYOCO_NATS_URL"] = f"nats://127.0.0.1:{nats_port}"
+            env["PYOCO_HTTP_AUTH_MODE"] = "api_key"
+
+            api_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "pyoco_server.http_api:create_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(api_port),
+                    "--log-level",
+                    "warning",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            base_url = f"http://127.0.0.1:{api_port}"
+            _wait_http(f"{base_url}/health", timeout=15.0)
+
+            import httpx
+
+            created_a = subprocess.run(
+                [sys.executable, "-m", "pyoco_server.admin_cli", "api-key", "create", "--tenant", "tenant-a"],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            key_a = json.loads(created_a.stdout)
+            api_key_a = key_a["api_key"]
+            key_id_a = key_a["key_id"]
+
+            created_b = subprocess.run(
+                [sys.executable, "-m", "pyoco_server.admin_cli", "api-key", "create", "--tenant", "tenant-b"],
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            api_key_b = json.loads(created_b.stdout)["api_key"]
+
+            submit = httpx.post(
+                f"{base_url}/runs",
+                headers={"X-API-Key": api_key_a},
+                json={"flow_name": "main", "params": {}, "tag": "cancel-auth", "tags": ["cancel-auth"]},
+                timeout=5.0,
+            )
+            assert submit.status_code == 200
+            run_id = submit.json()["run_id"]
+
+            no_auth = httpx.post(f"{base_url}/runs/{run_id}/cancel", timeout=5.0)
+            assert no_auth.status_code == 401
+
+            missing = httpx.post(
+                f"{base_url}/runs/missing-run-id/cancel",
+                headers={"X-API-Key": api_key_a},
+                timeout=5.0,
+            )
+            assert missing.status_code == 404
+
+            cross = httpx.post(
+                f"{base_url}/runs/{run_id}/cancel",
+                headers={"X-API-Key": api_key_b},
+                timeout=5.0,
+            )
+            assert cross.status_code == 404
+
+            own = httpx.post(
+                f"{base_url}/runs/{run_id}/cancel",
+                headers={"X-API-Key": api_key_a},
+                timeout=5.0,
+            )
+            assert own.status_code == 200
+            own_body = own.json()
+            assert own_body["status"] == "CANCELLING"
+            assert own_body["cancel_requested_by"] == f"api_key:{key_id_a}"
+            assert float(own_body.get("cancel_requested_at") or 0.0) > 0.0
+
+            own2 = httpx.post(
+                f"{base_url}/runs/{run_id}/cancel",
+                headers={"X-API-Key": api_key_a},
+                timeout=5.0,
+            )
+            assert own2.status_code == 200
+            assert own2.json()["status"] == "CANCELLING"
+        finally:
+            if api_proc is not None:
+                api_proc.terminate()
+                api_proc.wait(timeout=5)
+            nats_proc.terminate()
+            nats_proc.wait(timeout=5)
+
+
 def test_http_gateway_e2e_submit_yaml_and_run():
     nats_server = shutil.which("nats-server")
     assert nats_server, "nats-server not found (expected via nats-server-bin)"
@@ -875,6 +1249,252 @@ tasks:
             nats_proc.wait(timeout=5)
 
 
+def test_http_gateway_vnext_list_cursor_filter_and_invalid_cursor():
+    nats_server = shutil.which("nats-server")
+    assert nats_server, "nats-server not found (expected via nats-server-bin)"
+
+    nats_port = _free_port()
+    mon_port = _free_port()
+    api_port = _free_port()
+
+    with tempfile.TemporaryDirectory() as store_dir:
+        nats_proc = subprocess.Popen(
+            [
+                nats_server,
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(nats_port),
+                "-m",
+                str(mon_port),
+                "-sd",
+                store_dir,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_proc = None
+        try:
+            _wait_tcp("127.0.0.1", nats_port, timeout=10.0)
+
+            env = dict(os.environ)
+            env["PYOCO_NATS_URL"] = f"nats://127.0.0.1:{nats_port}"
+
+            api_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "pyoco_server.http_api:create_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(api_port),
+                    "--log-level",
+                    "warning",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            base_url = f"http://127.0.0.1:{api_port}"
+            _wait_http(f"{base_url}/health", timeout=15.0)
+
+            workflow_yaml = """
+version: 1
+flow:
+  graph: |
+    add_one >> to_text
+  defaults:
+    x: 1
+tasks:
+  add_one:
+    callable: pyoco_server._workflow_test_tasks:add_one
+  to_text:
+    callable: pyoco_server._workflow_test_tasks:to_text
+""".lstrip()
+
+            client = PyocoHttpClient(base_url)
+            try:
+                # Prepare enough runs to verify cursor pagination.
+                r1 = client.submit_run("main", params={"i": 1}, tag="vnext", tags=["vnext"])["run_id"]
+                time.sleep(0.02)
+                r2 = client.submit_run("main", params={"i": 2}, tag="vnext", tags=["vnext"])["run_id"]
+                time.sleep(0.02)
+                r3 = client.submit_run("main", params={"i": 3}, tag="vnext", tags=["vnext"])["run_id"]
+
+                page1 = client.list_runs_vnext(tag="vnext", limit=1, updated_after=0.0)
+                assert isinstance(page1, dict)
+                assert isinstance(page1.get("items"), list)
+                assert len(page1["items"]) == 1
+                assert page1.get("next_cursor"), "expected next_cursor for subsequent page"
+
+                first_id = page1["items"][0].get("run_id")
+                page2 = client.list_runs_vnext(tag="vnext", limit=1, updated_after=0.0, cursor=page1["next_cursor"])
+                assert isinstance(page2.get("items"), list)
+                assert len(page2["items"]) == 1
+                assert page2["items"][0].get("run_id") != first_id
+                assert {r1, r2, r3}.issuperset({first_id, page2["items"][0].get("run_id")})
+
+                # YAML run to verify workflow_yaml_sha256 filter.
+                run_yaml = client.submit_run_yaml(workflow_yaml, flow_name="train", tag="vnext")["run_id"]
+                snap_yaml = client.get_run(run_yaml)
+                sha = snap_yaml.get("workflow_yaml_sha256")
+                assert sha
+
+                filtered = client.list_runs_vnext(
+                    workflow_yaml_sha256=sha,
+                    full=True,
+                    limit=10,
+                    updated_after=0.0,
+                )
+                items = filtered.get("items") or []
+                assert any(item.get("run_id") == run_yaml for item in items)
+                assert all(item.get("workflow_yaml_sha256") == sha for item in items)
+
+                import httpx
+
+                bad = httpx.get(
+                    f"{base_url}/runs",
+                    params={"cursor": "%%%bad%%%", "updated_after": 0},
+                    timeout=5.0,
+                )
+                assert bad.status_code == 422
+            finally:
+                client.close()
+        finally:
+            if api_proc is not None:
+                api_proc.terminate()
+                api_proc.wait(timeout=5)
+            nats_proc.terminate()
+            nats_proc.wait(timeout=5)
+
+
+def test_http_gateway_watch_sse_stream_reaches_terminal():
+    nats_server = shutil.which("nats-server")
+    assert nats_server, "nats-server not found (expected via nats-server-bin)"
+
+    nats_port = _free_port()
+    mon_port = _free_port()
+    api_port = _free_port()
+
+    with tempfile.TemporaryDirectory() as store_dir:
+        nats_proc = subprocess.Popen(
+            [
+                nats_server,
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(nats_port),
+                "-m",
+                str(mon_port),
+                "-sd",
+                store_dir,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_proc = None
+        try:
+            _wait_tcp("127.0.0.1", nats_port, timeout=10.0)
+
+            env = dict(os.environ)
+            env["PYOCO_NATS_URL"] = f"nats://127.0.0.1:{nats_port}"
+            env["PYOCO_RUN_HEARTBEAT_INTERVAL_SEC"] = "0.1"
+            env["PYOCO_WORKER_HEARTBEAT_INTERVAL_SEC"] = "0.2"
+
+            api_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "pyoco_server.http_api:create_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(api_port),
+                    "--log-level",
+                    "warning",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            base_url = f"http://127.0.0.1:{api_port}"
+            _wait_http(f"{base_url}/health", timeout=15.0)
+
+            cfg = NatsBackendConfig(nats_url=env["PYOCO_NATS_URL"])
+
+            @pyoco.task
+            def slow():
+                time.sleep(0.4)
+                return "ok"
+
+            flow = pyoco.Flow(name="main")
+            flow.add_task(slow.task)
+
+            def resolve_flow(name: str) -> pyoco.Flow:
+                assert name == "main"
+                return flow
+
+            client = PyocoHttpClient(base_url)
+            try:
+                run_id = client.submit_run("main", params={}, tag="watch", tags=["watch"])["run_id"]
+
+                async def run_worker_once():
+                    worker = await PyocoNatsWorker.connect(
+                        config=cfg,
+                        flow_resolver=resolve_flow,
+                        worker_id="w-watch",
+                        tags=["watch"],
+                    )
+                    try:
+                        processed = await worker.run_once(timeout=10.0)
+                        assert processed == run_id
+                    finally:
+                        await worker.close()
+
+                def worker_thread() -> None:
+                    time.sleep(0.5)
+                    asyncio.run(run_worker_once())
+
+                t = threading.Thread(target=worker_thread, daemon=True)
+                t.start()
+
+                statuses: list[str] = []
+                watch_iter = client.watch_run(run_id, timeout_sec=8)
+                try:
+                    for evt in watch_iter:
+                        if evt.get("event") != "snapshot":
+                            continue
+                        data = evt.get("data") or {}
+                        assert data.get("run_id") == run_id
+                        st = ((data.get("snapshot") or {}).get("status"))
+                        if st:
+                            statuses.append(st)
+                        if st in {"COMPLETED", "FAILED", "CANCELLED"}:
+                            break
+                finally:
+                    watch_iter.close()
+
+                t.join(timeout=10.0)
+                assert any(st in {"COMPLETED", "FAILED", "CANCELLED"} for st in statuses)
+            finally:
+                client.close()
+        finally:
+            if api_proc is not None:
+                api_proc.terminate()
+                api_proc.wait(timeout=5)
+            nats_proc.terminate()
+            nats_proc.wait(timeout=5)
+
+
 def test_http_gateway_metrics_and_workers_endpoints():
     nats_server = shutil.which("nats-server")
     assert nats_server, "nats-server not found (expected via nats-server-bin)"
@@ -984,19 +1604,362 @@ def test_http_gateway_metrics_and_workers_endpoints():
 
                 import httpx
 
-                # /workers should expose the TTL-KV contents (best-effort).
-                workers = httpx.get(f"{base_url}/workers", timeout=5.0).json()
+                # /workers should expose registry contents (best-effort).
+                workers = httpx.get(f"{base_url}/workers", params={"scope": "all"}, timeout=5.0).json()
                 assert any(w.get("worker_id") == "w-metrics" for w in workers)
                 w = next(w for w in workers if w.get("worker_id") == "w-metrics")
                 assert "m" in (w.get("tags") or [])
+                assert w.get("state") in {"IDLE", "STOPPED_GRACEFUL", "RUNNING", "DISCONNECTED"}
+                assert isinstance(w.get("wheel_sync"), dict)
+                assert w["wheel_sync"].get("last_result") in {"disabled", "idle", "ok", "error"}
 
                 # /metrics should expose at least run status counts.
                 metrics = httpx.get(f"{base_url}/metrics", timeout=5.0).text
                 assert 'pyoco_runs_total{status="COMPLETED"}' in metrics or 'pyoco_runs_total{status="FAILED"}' in metrics
+                assert "pyoco_runs_today_total" in metrics
                 assert "pyoco_workers_alive_total" in metrics
                 assert "pyoco_dlq_messages_total" in metrics
             finally:
                 client.close()
+        finally:
+            if api_proc is not None:
+                api_proc.terminate()
+                api_proc.wait(timeout=5)
+            nats_proc.terminate()
+            nats_proc.wait(timeout=5)
+
+
+def test_http_gateway_workers_filters_hide_and_disconnected():
+    nats_server = shutil.which("nats-server")
+    assert nats_server, "nats-server not found (expected via nats-server-bin)"
+
+    nats_port = _free_port()
+    mon_port = _free_port()
+    api_port = _free_port()
+
+    with tempfile.TemporaryDirectory() as store_dir:
+        nats_proc = subprocess.Popen(
+            [
+                nats_server,
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(nats_port),
+                "-m",
+                str(mon_port),
+                "-sd",
+                store_dir,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_proc = None
+        try:
+            _wait_tcp("127.0.0.1", nats_port, timeout=10.0)
+
+            env = dict(os.environ)
+            env["PYOCO_NATS_URL"] = f"nats://127.0.0.1:{nats_port}"
+            env["PYOCO_WORKER_DISCONNECT_TIMEOUT_SEC"] = "2.0"
+
+            api_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "pyoco_server.http_api:create_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(api_port),
+                    "--log-level",
+                    "warning",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            base_url = f"http://127.0.0.1:{api_port}"
+            _wait_http(f"{base_url}/health", timeout=15.0)
+
+            async def seed_workers() -> None:
+                nc = await nats.connect(env["PYOCO_NATS_URL"], name="pyoco-test-seed-workers")
+                try:
+                    js = nc.jetstream()
+                    kv = await js.key_value("pyoco_workers")
+                    now = time.time()
+                    seed = [
+                        {
+                            "worker_id": "w-idle",
+                            "instance_id": "i-idle",
+                            "state": "IDLE",
+                            "hidden": False,
+                            "tags": ["a"],
+                            "last_seen_at": now,
+                            "last_heartbeat_at": now,
+                        },
+                        {
+                            "worker_id": "w-hidden",
+                            "instance_id": "i-hidden",
+                            "state": "IDLE",
+                            "hidden": True,
+                            "tags": ["a"],
+                            "last_seen_at": now,
+                            "last_heartbeat_at": now,
+                        },
+                        {
+                            "worker_id": "w-stopped",
+                            "instance_id": "i-stopped",
+                            "state": "STOPPED_GRACEFUL",
+                            "hidden": False,
+                            "tags": ["b"],
+                            "last_seen_at": now,
+                            "last_heartbeat_at": now,
+                            "stopped_at": now - 1,
+                            "stop_reason": "graceful_shutdown",
+                        },
+                        {
+                            "worker_id": "w-stale",
+                            "instance_id": "i-stale",
+                            "state": "IDLE",
+                            "hidden": False,
+                            "tags": ["c"],
+                            "last_seen_at": now - 10.0,
+                            "last_heartbeat_at": now - 10.0,
+                        },
+                    ]
+                    for item in seed:
+                        await kv.put(
+                            item["worker_id"],
+                            json.dumps(item, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+                        )
+                finally:
+                    await nc.close()
+
+            asyncio.run(seed_workers())
+
+            import httpx
+
+            def _get_workers(params: dict | None = None) -> list[dict]:
+                deadline = time.time() + 5.0
+                last = None
+                while time.time() < deadline:
+                    resp = httpx.get(f"{base_url}/workers", params=params, timeout=5.0)
+                    last = resp
+                    if resp.status_code == 200:
+                        return resp.json()
+                    time.sleep(0.05)
+                assert last is not None
+                assert last.status_code == 200, last.text
+                return []
+
+            # default: scope=active, include_hidden=false
+            default_rows = _get_workers()
+            default_ids = {str(w.get("worker_id")) for w in default_rows}
+            assert "w-idle" in default_ids
+            assert "w-hidden" not in default_ids
+            assert "w-stopped" not in default_ids
+            assert "w-stale" not in default_ids
+
+            all_rows = _get_workers({"scope": "all"})
+            all_by_id = {str(w.get("worker_id")): w for w in all_rows}
+            assert {"w-idle", "w-stopped", "w-stale"}.issubset(set(all_by_id.keys()))
+            assert "w-hidden" not in all_by_id
+            assert all_by_id["w-stale"]["state"] == "DISCONNECTED"
+            assert all_by_id["w-stopped"]["state"] == "STOPPED_GRACEFUL"
+
+            dis_rows = _get_workers({"scope": "all", "state": "DISCONNECTED"})
+            assert [w.get("worker_id") for w in dis_rows] == ["w-stale"]
+
+            visible_hidden = _get_workers({"scope": "all", "include_hidden": "true"})
+            assert any(w.get("worker_id") == "w-hidden" for w in visible_hidden)
+
+            patch_ok = httpx.patch(
+                f"{base_url}/workers/w-idle",
+                json={"hidden": True},
+                timeout=5.0,
+            )
+            assert patch_ok.status_code == 200
+            after_hide = _get_workers()
+            assert all(w.get("worker_id") != "w-idle" for w in after_hide)
+
+            missing = httpx.patch(f"{base_url}/workers/missing", json={"hidden": True}, timeout=5.0)
+            assert missing.status_code == 404
+
+            bad_scope = httpx.get(f"{base_url}/workers", params={"scope": "oops"}, timeout=5.0)
+            assert bad_scope.status_code == 422
+        finally:
+            if api_proc is not None:
+                api_proc.terminate()
+                api_proc.wait(timeout=5)
+            nats_proc.terminate()
+            nats_proc.wait(timeout=5)
+
+
+def test_worker_registry_state_transitions_and_reconnect():
+    nats_server = shutil.which("nats-server")
+    assert nats_server, "nats-server not found (expected via nats-server-bin)"
+
+    nats_port = _free_port()
+    mon_port = _free_port()
+    api_port = _free_port()
+
+    with tempfile.TemporaryDirectory() as store_dir:
+        nats_proc = subprocess.Popen(
+            [
+                nats_server,
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(nats_port),
+                "-m",
+                str(mon_port),
+                "-sd",
+                store_dir,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_proc = None
+        try:
+            _wait_tcp("127.0.0.1", nats_port, timeout=10.0)
+
+            env = dict(os.environ)
+            env["PYOCO_NATS_URL"] = f"nats://127.0.0.1:{nats_port}"
+            env["PYOCO_WORKER_DISCONNECT_TIMEOUT_SEC"] = "0.5"
+            env["PYOCO_WORKER_HEARTBEAT_INTERVAL_SEC"] = "0.1"
+            env["PYOCO_RUN_HEARTBEAT_INTERVAL_SEC"] = "0.05"
+
+            api_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "pyoco_server.http_api:create_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(api_port),
+                    "--log-level",
+                    "warning",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            base_url = f"http://127.0.0.1:{api_port}"
+            _wait_http(f"{base_url}/health", timeout=15.0)
+
+            cfg = NatsBackendConfig(
+                nats_url=env["PYOCO_NATS_URL"],
+                worker_heartbeat_interval_sec=0.1,
+                run_heartbeat_interval_sec=0.05,
+                worker_disconnect_timeout_sec=0.5,
+            )
+
+            @pyoco.task
+            def slow():
+                time.sleep(0.5)
+                return "ok"
+
+            flow = pyoco.Flow(name="main")
+            flow.add_task(slow.task)
+
+            def resolve_flow(name: str) -> pyoco.Flow:
+                assert name == "main"
+                return flow
+
+            async def scenario() -> None:
+                import httpx
+
+                async with httpx.AsyncClient(base_url=base_url, timeout=5.0) as hc:
+                    worker = await PyocoNatsWorker.connect(
+                        config=cfg,
+                        flow_resolver=resolve_flow,
+                        worker_id="w-state",
+                        tags=["state"],
+                    )
+                    old_instance = None
+                    try:
+                        deadline = time.time() + 5.0
+                        while time.time() < deadline:
+                            rows = (await hc.get("/workers", params={"scope": "all"})).json()
+                            rec = next((w for w in rows if w.get("worker_id") == "w-state"), None)
+                            if rec and rec.get("state") == "IDLE":
+                                old_instance = rec.get("instance_id")
+                                break
+                            await asyncio.sleep(0.05)
+                        assert old_instance, "worker did not appear as IDLE"
+
+                        submitted = await hc.post(
+                            "/runs",
+                            json={"flow_name": "main", "params": {}, "tag": "state", "tags": ["state"]},
+                        )
+                        assert submitted.status_code == 200
+                        run_id = submitted.json()["run_id"]
+
+                        runner = asyncio.create_task(worker.run_once(timeout=10.0))
+                        saw_running = False
+                        deadline = time.time() + 5.0
+                        while time.time() < deadline:
+                            rows = (await hc.get("/workers", params={"scope": "all", "state": "RUNNING"})).json()
+                            if any(w.get("worker_id") == "w-state" for w in rows):
+                                saw_running = True
+                                break
+                            await asyncio.sleep(0.05)
+                        assert saw_running, "worker RUNNING state was not observed"
+
+                        processed = await runner
+                        assert processed == run_id
+
+                        rec_idle = None
+                        deadline = time.time() + 5.0
+                        while time.time() < deadline:
+                            rows = (await hc.get("/workers", params={"scope": "all"})).json()
+                            rec = next((w for w in rows if w.get("worker_id") == "w-state"), None)
+                            if rec and rec.get("state") == "IDLE" and rec.get("last_run_id") == run_id:
+                                rec_idle = rec
+                                break
+                            await asyncio.sleep(0.05)
+                        assert rec_idle is not None
+                        assert rec_idle.get("last_run_status") in {"COMPLETED", "FAILED"}
+
+                        await worker.close()
+                        rows = (await hc.get("/workers", params={"scope": "all"})).json()
+                        stopped = next((w for w in rows if w.get("worker_id") == "w-state"), None)
+                        assert stopped is not None
+                        assert stopped.get("state") == "STOPPED_GRACEFUL"
+
+                        # reconnect with same worker_id should recover to IDLE and new instance_id
+                        worker2 = await PyocoNatsWorker.connect(
+                            config=cfg,
+                            flow_resolver=resolve_flow,
+                            worker_id="w-state",
+                            tags=["state"],
+                        )
+                        try:
+                            deadline = time.time() + 5.0
+                            rec2 = None
+                            while time.time() < deadline:
+                                rows = (await hc.get("/workers", params={"scope": "all"})).json()
+                                rec2 = next((w for w in rows if w.get("worker_id") == "w-state"), None)
+                                if rec2 and rec2.get("state") == "IDLE":
+                                    break
+                                await asyncio.sleep(0.05)
+                            assert rec2 is not None
+                            assert rec2.get("state") == "IDLE"
+                            assert rec2.get("instance_id") != old_instance
+                        finally:
+                            await worker2.close()
+                    finally:
+                        # worker is already closed in normal flow; keep idempotent.
+                        await worker.close()
+
+            asyncio.run(scenario())
         finally:
             if api_proc is not None:
                 api_proc.terminate()

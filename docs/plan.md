@@ -1,59 +1,42 @@
 # plan.md（必ず書く：最新版）
 
 # current
-- [x] `docs/OVERVIEW.md` を確認し、Phase 2（v0.2）完了 / Phase 3（v0.3 opt-in）着手に現在地を更新する（`docs/OVERVIEW.md`）
-- [x] Phase 3（v0.3 opt-in）：API key 認証と tenant attribution の仕様を追記する（HTTPは既定で無認証、opt-inで有効化）（`docs/spec.md`）
-- [x] Phase 3（v0.3 opt-in）：API key を NATS KV に保存する方針・キー構造・ローテーション/失効・秘匿（平文非保存/ログ非出力）を設計に追記する（`docs/architecture.md`）
-- [x] Phase 3（v0.3 opt-in）：設定（env vars / `.env`）を追記する（Auth用KV bucket、Authモード、ヘッダ名）（`docs/config.md` / `docs/spec.md` 付録I）
-- [x] Phase 3（v0.3 opt-in）：HTTP API 契約（`X-API-Key`、401/403、run snapshotへの `tenant_id`/`key_id` 露出）を追記する（`docs/library_api.md`）
-- [x] チュートリアル/Quickstartに「認証opt-in」手順を追記する（`docs/quickstart.md` / `docs/tutorial_multi_worker.md`）
-
-- [x] v0.2.0 の区切り：全テストを実行してグリーンを確認する（`uv run pytest`）
-- [x] v0.2.0 の区切り：現状実装が Phase 2 までを満たしている前提で version を更新する（`pyproject.toml` / `README.md` / `docs/OVERVIEW.md`）
-
-- [x] Auth用の env vars と設定項目を追加する（例：`PYOCO_HTTP_AUTH_MODE` / `PYOCO_AUTH_KV_BUCKET`）（`src/pyoco_server/config.py`）
-- [x] 追加した env vars の単体テストを更新する（`tests/test_config_from_env.py`）
-- [x] JetStream resources に Auth用KV bucket を追加する（`src/pyoco_server/resources.py`）
-- [x] E2E（現物）：Gateway起動時に Auth KV bucket が自動作成されることを検証する（`tests/test_nats_e2e.py`）
-
-- [x] API key レコード（`tenant_id`/`key_id`/hash/salt/失効など）と検証ロジックを実装する（平文非保存、ログ非出力）（`src/pyoco_server/auth.py`）
-- [x] API key の単体テストを追加する（hash/verify、失効判定、入力バリデーション）（`tests/test_auth.py`）
-- [x] API key 管理コマンド（create/list/revoke）を実装する（保存先は NATS KV、平文キーは生成時の1回のみ出力）（`src/pyoco_server/admin_cli.py` など）
-- [x] E2E（現物）：API key 管理コマンドでキーを発行し、KVに保存できることを検証する（`tests/test_nats_e2e.py`）
-
-- [x] HTTP Gateway に API key 認証（opt-in）を実装する（ヘッダ `X-API-Key`、失敗は 401/403）（`src/pyoco_server/http_api.py`）
-- [x] E2E（現物）：既定（無認証）のまま `POST /runs` がヘッダ無しで成功することを検証する（後方互換）（`tests/test_nats_e2e.py`）
-- [x] E2E（現物）：Auth有効時に API key なし/不正/失効で `POST /runs` が 401/403 になることを検証する（`tests/test_nats_e2e.py`）
-
-- [x] 認証成功時に `tenant_id`/`key_id` を run snapshot と job payload に刻む（workerは検証しない）（`src/pyoco_server/http_api.py` / `src/pyoco_server/models.py` / `src/pyoco_server/worker.py`）
-- [x] E2E（現物）：正しい API key で `POST /runs` が成功し、`GET /runs/{run_id}` に `tenant_id`/`key_id` が出ることを検証する（`tests/test_nats_e2e.py`）
-
-- [x] v0.3.0 の区切り：全テストを実行してグリーンを確認する（`uv run pytest`）
-- [x] v0.3.0 の区切り：version を更新する（`pyproject.toml` / `README.md` / `docs/OVERVIEW.md`）
-- [x] Phase 4（v0.4）：pyoco 0.6.1 の「flow単体（`flow:`）」に合わせ、YAML投入（`POST /runs/yaml`）の仕様・設計・実装・テストを追加する（`docs/*` / `src/*` / `tests/*`）
-- [x] Phase 4（v0.4）：`docs/OVERVIEW.md` の現在地を更新する（Phase 4 / v0.4.0、pyoco 0.6.1 single-flow）（`docs/OVERVIEW.md`）
-- [x] Phase 4（v0.4）：仕様（REQ/ERR/MSG）に「YAML（flow.yaml）でrun投入」を追加する（サイズ上限/不明キー拒否、paramsは `flow.defaults` を正本）（`docs/spec.md`）
-- [x] Phase 4（v0.4）：設定に「YAML投入のサイズ上限」を追加する（`PYOCO_WORKFLOW_YAML_MAX_BYTES`）（`docs/config.md` / `src/pyoco_server/config.py`）
-- [x] Phase 4（v0.4）：実装：HTTP Gateway に `POST /runs/yaml`（multipart）を追加し、YAMLをメッセージに埋めてpublishする（`src/pyoco_server/http_api.py`）
-- [x] Phase 4（v0.4）：実装：RunJob に `workflow_yaml` を追加し、worker が YAML から Flow を構築して実行できるようにする（`src/pyoco_server/models.py` / `src/pyoco_server/worker.py`）
-- [x] Phase 4（v0.4）：実装：Python library API に YAML投入メソッドを追加する（`src/pyoco_server/http_client.py` / `docs/library_api.md`）
-- [x] Phase 4（v0.4）：単体テスト：YAMLの不明キー拒否/禁止キー/defaults抽出を検証する（`tests/test_workflow_yaml.py`）
-- [x] Phase 4（v0.4）：E2E（現物）：実 `nats-server` + 実 `uvicorn` で `POST /runs/yaml`→worker実行→COMPLETED を検証する（`tests/test_nats_e2e.py`）
-- [x] Phase 4（v0.4）：ドキュメントを更新する（Quickstart / tutorial に YAML投入手順、pyoco 0.6.1 single-flow 前提を追記）（`docs/quickstart.md` / `docs/tutorial_multi_worker.md` / `docs/spec.md` / `docs/config.md`）
-- [x] v0.4.0 の区切り：全テストを実行してグリーンを確認する（`uv run pytest`）
-- [x] v0.4.0 の区切り：version を更新する（`pyproject.toml` / `README.md` / `docs/OVERVIEW.md` / `src/pyoco_server/http_api.py`）
-- [ ] 最終整合チェック（docs相互リンク、UC/REQ/ERR/MSG、設定キー、実装/テストの対応）を行い、ユーザー確認で合意を取る（レビューゲート）（`docs/OVERVIEW.md` 起点）
+- [x] 追加要望対応：wheelアップロード時に複数タグを保持し、workerタグ一致時のみ同期する仕様を反映する（`src/pyoco_server/http_api.py` / `src/pyoco_server/worker.py` / `src/pyoco_server/client_cli.py`）
+- [x] 現状確認：workerの依存配布運用を調査し、wheelレジストリ（server管理 + worker同期）の実装方針を確定する（`src/pyoco_server/http_api.py` / `src/pyoco_server/worker.py` / `src/pyoco_server/resources.py`）
+- [x] 実装1（リソース/設定）：JetStream Object Store を wheel レジストリとして追加し、env/CLI設定を拡張する（`src/pyoco_server/config.py` / `src/pyoco_server/resources.py` / `src/pyoco_server/worker_cli.py`）
+- [x] 実装2（HTTP/CLI）：`/wheels` API（list/upload/download/delete）と `pyoco-client` の wheel 管理コマンドを追加する（`src/pyoco_server/http_api.py` / `src/pyoco_server/http_client.py` / `src/pyoco_server/client_cli.py`）
+- [x] 実装3（worker）：wheel同期（差分検知・ローカル保存・差分インストール）を追加する（`src/pyoco_server/worker.py`）
+- [x] テスト：config/CLI/wheel registry/worker同期のテストを追加し、全テストを実行してグリーンを確認する（`tests/test_config_from_env.py` / `tests/test_wheel_registry.py` / `uv run pytest -q`）
+- [x] 文書化：OVERVIEW/config に wheel レジストリ運用を反映する（`docs/OVERVIEW.md` / `docs/config.md`）
+- [x] 文書化（全面更新）：wheelタグ付き配布仕様を concept/spec/architecture/library_api/quickstart/tutorial/README に反映する（`docs/concept.md` / `docs/spec.md` / `docs/architecture.md` / `docs/library_api.md` / `docs/quickstart.md` / `docs/tutorial_multi_worker.md` / `README.md`）
+- [x] 追加要望対応：wheel配布履歴（upload/delete）とアップロード元情報（source/actor）を記録・参照できるようにする（`src/pyoco_server/http_api.py` / `src/pyoco_server/resources.py` / `src/pyoco_server/http_client.py` / `src/pyoco_server/client_cli.py`）
+- [x] 追加要望対応：wheel配布ポリシーを「同一パッケージは必ずバージョンアップ」に固定し、同一/過去バージョンを409で拒否する。workerはタグ一致候補の最新版のみ同期する（`src/pyoco_server/http_api.py` / `src/pyoco_server/worker.py` / `tests/test_wheel_registry.py` / `docs/spec.md`）
+- [x] 追加要望対応：worker側でwheel互換性（Python/ABI/Platformタグ）を判定し、互換外をskipする。同期結果を `wheel_sync` として worker registry / `GET /workers` で可視化する（`src/pyoco_server/worker.py` / `tests/test_wheel_registry.py` / `docs/spec.md` / `docs/architecture.md`）
+- [x] 現状確認：pyoco 0.6.2 の cancel API（`Engine.cancel(run_id)`）と現行 server/worker の実装差分を確認し、cancel導入方針を固定する（`src/pyoco_server/worker.py` / `src/pyoco_server/http_api.py`）
+- [x] 文書化1（concept/spec/architecture）：cancel（`POST /runs/{run_id}/cancel`、`CANCELLING -> CANCELLED`、best-effort、`PYOCO_CANCEL_GRACE_PERIOD_SEC`）を反映する（`docs/concept.md` / `docs/spec.md` / `docs/architecture.md`）
+- [x] 実装1（HTTP）：`POST /runs/{run_id}/cancel` を追加し、非terminal run を `CANCELLING` へ遷移させる（`src/pyoco_server/http_api.py`）
+- [x] テスト1（HTTP）：cancel API の正常系/冪等/不存在/認証系を検証する（`tests/test_nats_e2e.py`）
+- [x] 実装2（worker）：cancel要求の検知と `Engine.cancel(run_id)` 連携を実装し、`CANCELLED` terminal 化を追加する（`src/pyoco_server/worker.py` / `src/pyoco_server/models.py`）
+- [x] テスト2（worker）：`RUNNING -> CANCELLING -> CANCELLED` と cancel timeout（best-effort）を検証する（`tests/test_nats_e2e.py`）
+- [x] 実装3（client/CLI）：`PyocoHttpClient.cancel_run()` と `pyoco-client cancel --run-id ... [--wait --timeout-sec]` を追加する（`src/pyoco_server/http_client.py` / `src/pyoco_server/client_cli.py`）
+- [x] テスト3（client/CLI）：cancelサブコマンドの入力/終了コード/待機動作を検証する（`tests/test_client_cli.py`）
+- [x] 実装4（Dashboard）：Run一覧/詳細に cancel 操作と `CANCELLING` 表示を追加する（`src/pyoco_server/static/index.html` / `src/pyoco_server/static/app.js` / `src/pyoco_server/static/styles.css`）
+- [x] テスト4（Dashboard E2E）：実行中runのcancel操作と状態遷移表示を検証する（`tests/test_dashboard_playwright_e2e.py`）
+- [x] 実装5（運用文書）：README/quickstart/tutorial/library_api/config を cancel導線に更新する（`README.md` / `docs/quickstart.md` / `docs/tutorial_multi_worker.md` / `docs/library_api.md` / `docs/config.md`）
+- [x] テスト5（総合E2E）：cancelを含む代表シナリオでE2Eを実行する（`uv run pytest -q tests/test_nats_e2e.py -k cancel`、`uv run pytest -q tests/test_dashboard_playwright_e2e.py -k cancel`、`uv run pytest -q`）
+- [x] スクリーン・スナップショット作成：cancel操作前後（RUNNING/CANCELLING/CANCELLED）の画面を撮影し成果物化する（例：`/tmp/*.png` と `/mnt/c/Users/kitad/`）
+- [x] 最終確認：docs実装整合（concept/spec/architecture/quickstart）とレビューゲート（ユーザー合意）を実施する
 
 # future
 （現状スナップショット：実装/テスト/デモの所在 は `docs/OVERVIEW.md` に移動）
 
-- Phase 4（将来）：運用I/Fの拡張
+- Phase 4（将来）：運用I/Fの追加改善
   - runs一覧の追加改善（必要なら）
-    - filters: `updated_after`（最近だけ） / `cursor`（ページング） / `workflow_yaml_sha256` filter
-  - 状態ストリーミング（SSE）
-    - `/runs/{run_id}/watch`（KV watch backed）
-  - 取消（best-effort）
-    - `POST /runs/{run_id}/cancel`（flagをKVへ、workerがheartbeatで確認）
+    - sort指定 / 継続ページングの安定化（KV scan前提での best-effort 改善）
+  - 状態ストリーミング（SSE）の追加改善
+    - `Last-Event-ID` / replay window / backpressure 対応
+  - 取消（高度化）
+    - cancel reason / requested_by の可視化、`--wait` 収束戦略の改善、timeout後の運用導線整備
   - event stream（履歴/ログ）
     - KV肥大化回避のための append-only stream（例：`pyoco.events.>`）
 
