@@ -1,77 +1,73 @@
 pyoco-server (NATS backend for Pyoco)
 ====================================
 
-This repository is an early-stage library that enables **distributed execution**
-of **Pyoco** workflows using **NATS** (JetStream) as the transport and durable
-queue.
+`pyoco-server` is a lightweight distributed execution backend for Pyoco.
+It is optimized for internal systems (single organization, small ops team),
+not for a large strict multi-tenant platform.
 
 Version: 0.5.0
 
-Goals
------
+Positioning
+-----------
 
-- Run Pyoco flows with a lightweight client/worker model.
-- Use NATS JetStream for a durable work queue (pull-based workers, tag routing).
-- Provide run status visibility (latest snapshot via JetStream Key-Value).
-- Provide an optional HTTP gateway so Pyoco users do not need to handle NATS.
-- Keep local dev/test setup simple: start NATS with `nats-server-bin` and manage
-  it with `nats-bootstrap`.
+- Role: distributed execution backend (HTTP Gateway + worker + NATS JetStream).
+- Optimization target: internal platform operations by one team.
+- Non-goal: strict multi-tenant isolation platform with strong audit separation.
 
-Current state
+Value proposition with `nats-bootstrap`
+---------------------------------------
+
+`pyoco-server` focuses on execution, while `nats-bootstrap` handles practical
+NATS operations with the same CLI family across local and cluster workflows.
+
+- Symmetric operations: `up` / `join` / `status` / `doctor` / `backup` /
+  `restore` / `leave` / `down` / `service` are provided by `nats-bootstrap`.
+- Day-2 operations: lifecycle and recovery are scriptable from CLI.
+- Complexity level: designed to be operable by a small team.
+
+Evidence (commands):
+
+```bash
+uv run nats-bootstrap --help
+uv run nats-bootstrap up --help
+uv run nats-bootstrap join --help
+uv run nats-bootstrap status --help
+uv run nats-bootstrap doctor --help
+uv run nats-bootstrap backup --help
+uv run nats-bootstrap restore --help
+uv run nats-bootstrap leave --help
+uv run nats-bootstrap down --help
+uv run nats-bootstrap service --help
+```
+
+Fit / Non-fit
 -------------
 
-This repo is under active construction. See `docs/concept.md` for the initial
-architecture and message design.
+Fit:
 
-Quickstart
-----------
+- One team operating one internal environment.
+- Internal platform where users submit jobs via HTTP.
+- Docker-centric deployment with NATS JetStream.
+- "Start small, then operate" use cases needing queue + latest status + basic ops.
 
-See `docs/quickstart.md` for a 5-minute end-to-end demo (HTTP submit -> NATS queue -> worker execution -> status query).
+Non-fit:
 
-CLI commands
-------------
+- Strict multi-tenant boundary requirements (hard isolation per tenant).
+- Strong audit/compliance separation across organizations.
+- Very large-scale SLO/SLA platforms requiring advanced fairness and isolation.
 
-- `pyoco-server`: HTTP Gateway launcher
-- `pyoco-worker`: worker launcher
-- `pyoco-client`: HTTP client CLI (`submit/get/list/watch/tasks/workers/metrics/wheels/wheel-history/wheel-upload/wheel-delete`)
-- `pyoco-server-admin`: API key management CLI
+Quickstart (shortest path)
+--------------------------
 
-CLI UX highlights (v0.4)
-------------------------
-
-- `pyoco-client submit` supports:
-  - `--params '{"x":1}'` (JSON object)
-  - `--params-file params.yaml` (JSON/YAML object file)
-  - `--param key=value` (repeatable, override-friendly)
-- `pyoco-client list` / `list-vnext`: `--output json|table`
-- `pyoco-client watch`: `--output json|status`
-- User-fixable errors return exit code `1` with correction hints on stderr.
-
-YAML-first run (recommended)
-----------------------------
-
-`.env` is loaded automatically by `NatsBackendConfig.from_env()` (default file: `.env`).
-You can disable it with `PYOCO_LOAD_DOTENV=0` or change the file path with `PYOCO_ENV_FILE`.
+For the shortest local path (single-node NATS managed together):
 
 ```bash
 uv sync
-uv run nats-server -js -a 127.0.0.1 -p 4222 -m 8222
-```
-
-Or start server + local NATS together via `nats-bootstrap`:
-
-```bash
 uv run pyoco-server up --with-nats-bootstrap --host 127.0.0.1 --port 8000 --dashboard-lang auto
-```
-
-```bash
-export PYOCO_NATS_URL="nats://127.0.0.1:4222"
-uv run pyoco-server up --host 127.0.0.1 --port 8000 --dashboard-lang auto
-```
-
-```bash
 uv run pyoco-worker --nats-url nats://127.0.0.1:4222 --tags hello --worker-id w1
 ```
+
+Then submit a YAML workflow:
 
 ```bash
 cat > flow.yaml <<'YAML'
@@ -87,26 +83,74 @@ tasks:
   to_text:
     callable: pyoco_server._workflow_test_tasks:to_text
 YAML
-```
 
-```bash
 uv run pyoco-client --server http://127.0.0.1:8000 submit-yaml --workflow-file flow.yaml --flow-name main --tag hello
-uv run pyoco-client --server http://127.0.0.1:8000 list --tag hello --limit 20
-uv run pyoco-client --server http://127.0.0.1:8000 list --tag hello --limit 20 --output table
 uv run pyoco-client --server http://127.0.0.1:8000 watch <run_id> --until-terminal --output status
 ```
 
-Tutorial (multi-worker)
------------------------
+For single-node or 3-node cluster startup details, see `docs/quickstart.md`.
 
-See `docs/tutorial_multi_worker.md` for a more guided walkthrough with one server and multiple workers (CPU/GPU tags), plus ops endpoints.
+Operational constraints (current behavior)
+------------------------------------------
+
+These are current constraints aligned with implemented behavior and
+`nats-bootstrap` 0.0.9 CLI/runtime behavior.
+
+1. `backup` / `restore` require `nats` CLI.
+- `nats-bootstrap backup --help` and `restore --help` expose `--nats-cli-path`.
+- If `nats` CLI cannot be resolved, command fails (`nats cli not found`).
+
+2. `leave` / `controller` are MVP-scoped.
+- `leave` requires `--confirm` and controller endpoint(s).
+- `--controller` must point to the endpoint started by `nats-bootstrap controller start`
+  (not the NATS monitor port).
+- `--stop-anyway` allows success when controller is unavailable, but local stop
+  is skipped in MVP behavior.
+- `controller` currently provides `start` operation.
+
+3. `down` depends on PID file in current directory.
+- `down` requires `--confirm` and `./nats-server.pid`.
+- If PID file is missing/invalid, `down` fails.
+- If you need `down`, start NATS with PID output, e.g.:
+
+```bash
+uv run nats-bootstrap up -- -js -a 127.0.0.1 -p 4222 -m 8222 -P nats-server.pid
+uv run nats-bootstrap down --confirm
+```
+
+Current state
+-------------
+
+This repo is under active construction. See `docs/concept.md` and `docs/spec.md`
+for current behavior and contracts.
+
+CLI commands
+------------
+
+- `pyoco-server`: HTTP Gateway launcher
+- `pyoco-worker`: worker launcher
+- `pyoco-client`: HTTP client CLI (`submit/get/list/watch/tasks/workers/metrics/wheels/wheel-history/wheel-upload/wheel-delete`)
+- `pyoco-server-admin`: API key management CLI
+
+YAML-first run (recommended)
+----------------------------
+
+`.env` is loaded automatically by `NatsBackendConfig.from_env()` (default file: `.env`).
+You can disable it with `PYOCO_LOAD_DOTENV=0` or change the file path with `PYOCO_ENV_FILE`.
+
+```bash
+export PYOCO_NATS_URL="nats://127.0.0.1:4222"
+uv run pyoco-server up --host 127.0.0.1 --port 8000 --dashboard-lang auto
+```
 
 Docs
 ----
 
+- Japanese README: `README_ja.md`
 - Concept: `docs/concept.md`
 - Spec (contract): `docs/spec.md`
 - Architecture: `docs/architecture.md`
+- Quickstart: `docs/quickstart.md`
 - Library API (Python): `docs/library_api.md`
 - Config (.env): `docs/config.md`
 - Roadmap: `docs/plan.md`
@@ -129,16 +173,6 @@ Run tests (will start an ephemeral NATS server for integration tests):
 
 ```bash
 uv run pytest
-```
-
-HTTP Gateway (MVP)
-------------------
-
-Run the HTTP API (reads NATS settings from env):
-
-```bash
-export PYOCO_NATS_URL="nats://127.0.0.1:4222"
-uv run pyoco-server up --host 0.0.0.0 --port 8000 --dashboard-lang auto
 ```
 
 Tag routing

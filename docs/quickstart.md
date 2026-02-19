@@ -1,10 +1,10 @@
-# Quickstart（5分）：run分散実行
+# Quickstart（5分）：pyoco-server + nats-bootstrap 最短導線
 
-このガイドは、想定するユーザー体験（MVP）を5分で確認するための手順です。
+このガイドは、`pyoco-server` を「社内システム向けの軽量分散実行バックエンド」として最短で確認する手順です。
 
-- Client は HTTP だけを使う
-- Server は NATS JetStream と通信する
-- Worker が NATS から run を pull して Pyoco を実行する
+- Client は HTTP を使う
+- Server/Worker は NATS JetStream を使う
+- 運用は `nats-bootstrap` 連携を中心に回す
 
 ## 0) 依存関係を入れる
 
@@ -12,99 +12,19 @@
 uv sync
 ```
 
-## 1) NATSを起動する（単体）
+## 1) 最短手順（単体NATSを同時起動）
 
 別ターミナルで実行します。
-
-```bash
-uv run nats-server -js -a 127.0.0.1 -p 4222 -m 8222
-```
-
-`nats-bootstrap` をラッパとして使うこともできます。
-
-```bash
-uv run nats-bootstrap up -- -js -a 127.0.0.1 -p 4222 -m 8222
-```
-
-## 1b) NATSを起動する（クラスタ：任意）
-
-ローカル3ノードクラスタを使いたい場合、3つのターミナルでそれぞれ実行します。
-
-ターミナルA：
-
-```bash
-uv run nats-bootstrap up --cluster pyoco --listen 127.0.0.1 --client-port 4222 --http-port 8222 --cluster-port 6222 --datafolder artifacts/nats/n1
-```
-
-ターミナルB：
-
-```bash
-uv run nats-bootstrap join --cluster pyoco --seed 127.0.0.1:6222 --listen 127.0.0.1 --client-port 4223 --http-port 8223 --cluster-port 6223 --datafolder artifacts/nats/n2
-```
-
-ターミナルC：
-
-```bash
-uv run nats-bootstrap join --cluster pyoco --seed 127.0.0.1:6222 --listen 127.0.0.1 --client-port 4224 --http-port 8224 --cluster-port 6224 --datafolder artifacts/nats/n3
-```
-
-以降の手順では、Aノードを `nats://127.0.0.1:4222` として利用します。
-
-## 2) HTTP Gateway を起動する
-
-別ターミナルで実行します。
-
-`nats-bootstrap` でNATS同時起動したい場合（単体NATS）：
 
 ```bash
 uv run pyoco-server up --with-nats-bootstrap --host 127.0.0.1 --port 8000
 ```
 
-（任意）`.env` を使う場合：
-
-```bash
-set -a
-source .env
-set +a
-```
-
-（任意）ログ設定例：
-
-```bash
-export PYOCO_LOG_LEVEL="INFO"
-export PYOCO_LOG_FORMAT="json"
-export PYOCO_LOG_INCLUDE_TRACEBACK="true"
-```
-
-```bash
-export PYOCO_NATS_URL="nats://127.0.0.1:4222"
-uv run pyoco-server up --host 127.0.0.1 --port 8000
-```
-
 補足：
-- `--with-nats-bootstrap` は `nats-bootstrap` コマンドが見つからない場合エラーになります。
-- `--with-nats-bootstrap` は単体NATS起動のみを扱います（クラスタ運用は従来どおり手動起動）。
+- `--with-nats-bootstrap` は `nats-bootstrap` が無いと失敗します。
+- このモードは単体NATS起動のみです（クラスタは後述）。
 
-## 2b) （任意）HTTP認証（API key）を有効化する
-「簡単に始める」ため、既定では無認証です。運用で保護したい場合だけ有効化します。
-
-HTTP Gateway を起動する前に設定します：
-
-```bash
-export PYOCO_HTTP_AUTH_MODE="api_key"
-export PYOCO_AUTH_KV_BUCKET="pyoco_auth"
-export PYOCO_HTTP_API_KEY_HEADER="X-API-Key"
-```
-
-API key を発行します（平文キーはこの時だけ表示されます）：
-
-```bash
-uv run python -m pyoco_server.admin_cli api-key create --tenant demo
-```
-
-出力された API key を控えて、以降のリクエストに `X-API-Key` として付与してください。
-
-## 3) Worker を起動する（サンプルflow）
+## 2) Worker を起動する
 
 別ターミナルで実行します。
 
@@ -112,34 +32,7 @@ uv run python -m pyoco_server.admin_cli api-key create --tenant demo
 uv run pyoco-worker --nats-url nats://127.0.0.1:4222 --tags hello --worker-id w1
 ```
 
-YAMLジョブ（`submit-yaml`）を主に使う場合、`--flow-resolver` は不要です。  
-`submit`（flow_name投入）も使う場合は `--flow-resolver examples/hello_flow.py:resolve_flow` を付けて起動してください。
-
-### 3b) （任意）wheel同期を有効化する
-workerごとの手動インストールを減らしたい場合は、wheel同期を有効化します。
-
-```bash
-export PYOCO_WHEEL_SYNC_ENABLED="1"
-export PYOCO_WHEEL_SYNC_DIR=".pyoco/wheels"
-uv run pyoco-worker --nats-url nats://127.0.0.1:4222 --tags hello --worker-id w1 --wheel-sync
-```
-
-wheel登録例（別ターミナル）：
-
-```bash
-uv run pyoco-client --server http://127.0.0.1:8000 wheel-upload --wheel-file dist/my_task_ext-0.1.0-py3-none-any.whl --tags hello,linux
-uv run pyoco-client --server http://127.0.0.1:8000 wheels
-uv run pyoco-client --server http://127.0.0.1:8000 wheel-history --limit 20
-```
-
-補足：
-- worker は「起動時」と「次回poll前」に同期します。
-- 実行中runの途中では wheel 更新を開始しません。
-- wheel tags が空の場合は、全workerが同期対象です。
-- 同一パッケージに複数バージョンがある場合、worker は最新版のみ同期します。
-- 同一パッケージを再配布する場合は、wheelバージョンを必ず上げてください（同一/過去バージョンは409）。
-
-## 4) YAML（flow.yaml）で run を投入する（推奨）
+## 3) YAML（flow.yaml）で run を投入する
 
 別ターミナルで実行します。
 
@@ -161,95 +54,122 @@ YAML
 
 ```bash
 uv run pyoco-client --server http://127.0.0.1:8000 submit-yaml --workflow-file flow.yaml --flow-name main --tag hello
-```
-
-（2b を有効にした場合は、API key を付与して投入します）
-
-```bash
-uv run pyoco-client --server http://127.0.0.1:8000 --api-key "<your_api_key>" submit-yaml --workflow-file flow.yaml --flow-name main --tag hello
-```
-
-確認できること：
-- worker がジョブを受け取り、実行する
-- `GET /runs/{run_id}` が `COMPLETED` とタスク状態を返す
-
-補助コマンド（例）：
-```bash
-uv run pyoco-client --server http://127.0.0.1:8000 list --tag hello --limit 20 --output table
-uv run pyoco-client --server http://127.0.0.1:8000 get <run_id>
 uv run pyoco-client --server http://127.0.0.1:8000 watch <run_id> --until-terminal --output status
 ```
 
-## 4b) （任意）flow_name で run を投入する（互換ルート）
-既存の `flow_name` ベース投入を使う場合は `submit` を利用します。
+補助コマンド：
 
 ```bash
-uv run pyoco-client --server http://127.0.0.1:8000 submit --flow-name main --tag hello --tags hello --param ts=1 --param name=demo
-```
-
-（2b を有効にした場合）
-```bash
-uv run pyoco-client --server http://127.0.0.1:8000 --api-key "<your_api_key>" submit --flow-name main --tag hello --tags hello --param ts=1 --param name=demo
-```
-
-`submit` の params 指定は次の3形式を併用できます（後勝ち）：
-- `--params-file params.yaml`（JSON/YAML object）
-- `--params '{"x":1}'`（JSON object）
-- `--param key=value`（複数回指定可）
-
-## 5) （任意）運用向けエンドポイントを確認する
-
-別ターミナルで実行します。
-
-Dashboard UI（read-only）：ブラウザで `http://127.0.0.1:8000/` を開きます。  
-Auth有効時は、画面右上に `X-API-Key` を入力して適用します。
-
-```bash
-curl -sS http://127.0.0.1:8000/metrics | head
+uv run pyoco-client --server http://127.0.0.1:8000 list --tag hello --limit 20 --output table
+uv run pyoco-client --server http://127.0.0.1:8000 get <run_id>
 curl -sS http://127.0.0.1:8000/workers
+curl -sS http://127.0.0.1:8000/metrics | head
 ```
 
-## 6) Workers運用状態を確認する（vNext）
+## 4) NATS起動方法（単体 / クラスタ）
 
-`/workers` は運用向けに、状態と表示制御（hidden）を扱えます。
-
-- state:
-  - `RUNNING`（実行中）
-  - `IDLE`（待機中）
-  - `STOPPED_GRACEFUL`（正常停止）
-  - `DISCONNECTED`（heartbeat途絶）
-- 既定値:
-  - `scope=active`（`RUNNING|IDLE`）
-  - `include_hidden=false`
-
-例（全workerを表示し、hiddenも含める）：
+### 4a) 単体NATS（nats-server 直接起動）
 
 ```bash
-curl -sS "http://127.0.0.1:8000/workers?scope=all&include_hidden=true"
+uv run nats-server -js -a 127.0.0.1 -p 4222 -m 8222
 ```
 
-例（状態で絞り込む）：
+### 4b) 単体NATS（nats-bootstrap）
 
 ```bash
-curl -sS "http://127.0.0.1:8000/workers?scope=all&state=DISCONNECTED"
+uv run nats-bootstrap up -- -js -a 127.0.0.1 -p 4222 -m 8222
 ```
 
-例（workerを一覧から非表示にする）：
+### 4c) クラスタNATS（3ノード）
+
+ターミナルA:
 
 ```bash
-curl -sS -X PATCH "http://127.0.0.1:8000/workers/w1" \
-  -H "Content-Type: application/json" \
-  -d '{"hidden": true}'
+uv run nats-bootstrap up --cluster pyoco --listen 127.0.0.1 --client-port 4222 --http-port 8222 --cluster-port 6222 --datafolder artifacts/nats/n1
 ```
 
-再表示（unhide）：
+ターミナルB:
 
 ```bash
-curl -sS -X PATCH "http://127.0.0.1:8000/workers/w1" \
-  -H "Content-Type: application/json" \
-  -d '{"hidden": false}'
+uv run nats-bootstrap join --cluster pyoco --seed 127.0.0.1:6222 --listen 127.0.0.1 --client-port 4223 --http-port 8223 --cluster-port 6223 --datafolder artifacts/nats/n2
 ```
 
-補足：
-- `DISCONNECTED` 判定の閾値は `PYOCO_WORKER_DISCONNECT_TIMEOUT_SEC`（既定 20 秒）です。
-- `pyoco-client workers` は現状、既定条件（active + 非hidden）での取得を想定しています。運用時の詳細条件指定は HTTP API（`/workers` クエリ）を利用します。
+ターミナルC:
+
+```bash
+uv run nats-bootstrap join --cluster pyoco --seed 127.0.0.1:6222 --listen 127.0.0.1 --client-port 4224 --http-port 8224 --cluster-port 6224 --datafolder artifacts/nats/n3
+```
+
+以降はAノードを `nats://127.0.0.1:4222` として `pyoco-server` / `pyoco-worker` を接続します。
+
+## 5) Day-2運用（nats-bootstrap）
+
+### 5a) 診断
+
+```bash
+uv run nats-bootstrap status
+uv run nats-bootstrap doctor
+```
+
+### 5b) 退避 / 復旧
+
+```bash
+uv run nats-bootstrap backup --stream PYOCO_WORK --output artifacts/backup
+uv run nats-bootstrap restore --input artifacts/backup --confirm
+```
+
+制約：`backup/restore` は `nats` CLI が必要です（必要に応じて `--nats-cli-path` を指定）。
+
+### 5c) ノード離脱 / 停止
+
+```bash
+uv run nats-bootstrap leave --controller <controller-endpoint> --confirm
+```
+
+制約：
+- `leave` は controller endpoint と `--confirm` が必須です。
+- `--controller` は NATS monitor（`:8222`）ではなく、`nats-bootstrap controller start` で立てた endpoint を指定します。
+- `--stop-anyway` を付けると controller 不達でも成功扱いにできますが、MVPではローカル停止を実行しません。
+- `controller` コマンドは現状 `start` 操作のみです。
+
+`down` を使う場合は、起動時に pid ファイルを作っておく必要があります。
+
+```bash
+uv run nats-bootstrap up -- -js -a 127.0.0.1 -p 4222 -m 8222 -P nats-server.pid
+uv run nats-bootstrap down --confirm
+```
+
+制約：`down` は `--confirm` と `./nats-server.pid` が前提です。
+
+### 5d) （Windows向け）service 管理
+
+```bash
+uv run nats-bootstrap service --help
+```
+
+`service` は Windows 向け運用コマンドです。
+
+## 6) （任意）HTTP認証（API key）
+
+運用で保護が必要な場合のみ有効化します。
+
+```bash
+export PYOCO_HTTP_AUTH_MODE="api_key"
+export PYOCO_AUTH_KV_BUCKET="pyoco_auth"
+export PYOCO_HTTP_API_KEY_HEADER="X-API-Key"
+uv run python -m pyoco_server.admin_cli api-key create --tenant demo
+```
+
+## 7) （任意）wheel同期
+
+```bash
+export PYOCO_WHEEL_SYNC_ENABLED="1"
+export PYOCO_WHEEL_SYNC_DIR=".pyoco/wheels"
+uv run pyoco-worker --nats-url nats://127.0.0.1:4222 --tags hello --worker-id w1 --wheel-sync
+```
+
+```bash
+uv run pyoco-client --server http://127.0.0.1:8000 wheel-upload --wheel-file dist/my_task_ext-0.1.0-py3-none-any.whl --tags hello,linux
+uv run pyoco-client --server http://127.0.0.1:8000 wheels
+uv run pyoco-client --server http://127.0.0.1:8000 wheel-history --limit 20
+```

@@ -4,6 +4,28 @@
 ※本書は v0.4 実装契約を維持しつつ、worker運用可視化・run取消（vNext）・wheel配布（vNext）に必要な要件を追加したもの。  
 ※I/F詳細（JSON例やフィールド列挙）は付録に集約し、要件本文は要件レベルに留める。
 
+## 本仕様の位置づけと適用範囲
+- `pyoco-server` は **Pyoco 本体ではなく**、Pyoco run を分散実行する軽量バックエンドとして位置づける。
+- 主対象は「単一組織・少人数運用」の社内システムであり、大規模マルチテナント基盤を目的にしない。
+- Fitするケース：
+  - 1チーム運用の社内基盤
+  - Docker中心で、HTTP投入 + NATS JetStream による分散実行を実施したい
+  - 導入/運用の複雑性を小さく保ちたい
+- Fitしないケース：
+  - 厳格マルチテナント（強い境界分離）
+  - 強い監査分離（組織横断での厳格な統制要件）
+  - 超大規模SLA（高度な公平制御/隔離制御が必須）
+
+## `nats-bootstrap` 連携の運用前提（Day-2）
+- 本仕様では `nats-bootstrap` 連携を運用導線の中核とする（`up/join/status/doctor/backup/restore/leave/down/service`）。
+- 根拠コマンド：`uv run nats-bootstrap --help`、各サブコマンド `--help`。
+- 現行制約（`nats-bootstrap` 0.0.9 実装と一致）：
+  - `backup` / `restore` は `nats` CLI 前提（`--nats-cli-path` を持ち、未解決時は失敗）
+  - `leave` は `--confirm` と controller endpoint（`nats-bootstrap controller start` のendpoint）が必須
+  - `--stop-anyway` は controller 不達時の成功扱いを許容するが、MVPではローカル停止を実行しない
+  - `controller` は現状 `start` 操作のみ
+  - `down` は `--confirm` + `./nats-server.pid` を前提（pid未作成/不正時は失敗）
+
 # 要件一覧（Requirements）
 | ID | 要件（固定書式・正常系のみ） | 関連UC-ID |
 |---|---|---|
@@ -692,6 +714,12 @@ Base URL 例：`http://127.0.0.1:8000`
   - `pyoco-client`：run投入/参照/監視/一覧/workers/metrics/wheels の操作
   - `pyoco-worker`：worker起動（tag/worker_id/resolver設定）
   - `pyoco-server`：HTTP Gateway起動（`up` サブコマンド、任意でNATS同時起動）
+- `nats-bootstrap` 連携（Day-2運用）：
+  - `up` / `join`：単体/クラスタ起動
+  - `status` / `doctor`：運用診断
+  - `backup` / `restore`：JetStream退避/復旧（`nats` CLI 前提）
+  - `leave` / `down`：ノード離脱/停止（MVP制約あり）
+  - `service`：サービス運用（Windows向け）
 - `pyoco-client` の主要入力（v0.4）：
   - `submit` の params は `--params-file`（JSON/YAML object）/`--params`（JSON object）/`--param key=value`（複数可）を併用できる（後勝ち）
   - `list` / `list-vnext` は `--output json|table`
@@ -701,6 +729,9 @@ Base URL 例：`http://127.0.0.1:8000`
 - 失敗時（v0）：
   - 引数検証失敗は exit code `1` で終了し、stderrに入力修正例を表示する
   - `pyoco-server up --with-nats-bootstrap` 指定時は、`nats-bootstrap` 不在/ポート競合/起動タイムアウトで exit code `1`
+  - `nats-bootstrap backup/restore` は `nats` CLI 未解決時に失敗する
+  - `nats-bootstrap leave` は controller endpoint（`nats-bootstrap controller start` のendpoint）が必須で、`--stop-anyway` は controller 不達時に「成功扱い（MVPではローカル停止を実施しない）」となる
+  - `nats-bootstrap down` は `./nats-server.pid` が無い/不正な場合に失敗する
   - HTTP呼び出し失敗は exit code `1` で終了し、stderrにHTTPエラー内容を表示する
   - `KeyboardInterrupt` は exit code `130`
 

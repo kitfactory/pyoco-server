@@ -22,6 +22,8 @@
   - run取消（`POST /runs/{run_id}/cancel`、`CANCELLING -> CANCELLED`、best-effort、`PYOCO_CANCEL_GRACE_PERIOD_SEC`）を実装し、HTTP/worker/CLI/Dashboard/E2E を反映済み
   - wheelレジストリ（JetStream Object Store）を追加し、`/wheels` API（list/upload/download/delete/history）と worker の wheel 同期・差分インストール（opt-in）を実装（wheelタグとworkerタグの一致で配布）
   - wheelアップロードは同一パッケージで「必ずバージョンアップ」を必須化（同一/過去バージョンは 409 で拒否）
+  - 文書方針を更新し、`pyoco-server` の位置づけを「軽量な分散実行バックエンド（社内システム向け最適化）」として明文化する
+  - `nats-bootstrap` 連携の価値（対称運用 / Day-2運用）と現行制約（backup/restore・leave/controller・down）を README / docs 全体で整合させる
 - 非ゴール（やらないこと）:
   - 厳密な公平性（優先度/同時実行上限）の実装
   - 強い隔離（tenant別subject/tenant別KV）を前提にした大規模な構成変更
@@ -35,6 +37,22 @@
   - tutorial（server + 複数worker）: `./tutorial_multi_worker.md`
   - library api: `./library_api.md`
   - config: `./config.md`
+
+---
+
+## 位置づけ（社内システム向け最適化）
+- `pyoco-server` は **Pyoco 本体ではなく**、HTTP Gateway + worker + NATS JetStream で run を分散実行する **軽量バックエンド**。
+- 主対象は「単一組織・少人数運用」の社内システム。大規模な厳格マルチテナント基盤は設計中心に置かない。
+- 運用の中核は `nats-bootstrap` 連携（`up/join/status/doctor/backup/restore/leave/down/service`）で、単体/クラスタの運用手順を同一CLI系列に寄せる。
+- Day-2運用の代表：
+  - 稼働確認：`uv run nats-bootstrap status` / `uv run nats-bootstrap doctor`
+  - ノード運用：`uv run nats-bootstrap join ...` / `uv run nats-bootstrap leave --confirm --controller <endpoint>`
+  - 退避/復旧：`uv run nats-bootstrap backup --stream <stream> --output <dir>` / `uv run nats-bootstrap restore --input <dir> --confirm`
+- 現行の制約（`nats-bootstrap` 0.0.9 実装に一致）：
+  - `backup` / `restore` は `nats` CLI 解決が前提（`--nats-cli-path` 指定可）
+  - `leave` は controller endpoint（`nats-bootstrap controller start` のendpoint）と `--confirm` が必須。`--stop-anyway` は controller 不達時の成功扱いを許容するが、MVPではローカル停止を行わない
+  - `controller` は現状 `start` 操作のみ
+  - `down` は `--confirm` + `./nats-server.pid` を前提（pidファイルが無い/不正なら失敗）
 
 ---
 

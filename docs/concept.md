@@ -1,11 +1,11 @@
 # concept.md（必ず書く：最新版）
 #1.概要（Overview）（先頭固定）
-- 作るもの（What）：Pyoco のワークフロー実行（run）を、HTTP（Client-Server）と NATS JetStream（Server-Worker）で分散実行するための最小バックエンド。
+- 作るもの（What）：Pyoco **本体ではなく**、Pyoco のワークフロー実行（run）を HTTP（Client-Server）と NATS JetStream（Server-Worker）で分散実行するための軽量バックエンド。
 - 解決すること（Why）：Pyoco 利用者が NATS を意識せずに「run投入」「run/タスク状態参照」をできるようにし、導入と運用の負担を最小化する。
 - できること（主要機能の要約）：HTTPでrun投入、KVスナップショットで状態参照、タスク状態参照、一覧/フィルタ、worker運用可視化（状態区別・手動hide・表示制御）、DLQで診断、長時間runの再配送防止（in_progress ACK）と心拍、運用向けエンドポイント（/metrics, /workers）、GUI向けの最小状態管理I/F（一覧差分取得・run監視SSE）、CLI（server/worker/client/admin）による運用操作、run取消（cancel、best-effort）、wheelレジストリとworkerタグ一致での依存配布、wheel配布履歴（アップロード元情報付き）の参照。
-- 使いどころ（When/Where）：Pyoco flow を複数ノード（複数worker）で実行したいが、DBや巨大オーケストレータは持ち込みたくないチーム/環境。
+- 使いどころ（When/Where）：単一組織の社内システムで、Pyoco flow を複数ノード（複数worker）で実行したいが、DBや巨大オーケストレータは持ち込みたくない小規模チーム。
 - 成果物（Outputs）：HTTP Gateway（FastAPI）、Worker（Pyoco Engine実行）、JetStreamリソース定義（Stream/KV/DLQ）、PythonライブラリAPI、Quickstart/例、運用向け最小GUI（read-only）。
-- 前提（Assumptions）：NATS JetStream が利用可能（信頼性の基盤）、実行保証は at-least-once（重複実行あり得る）、外部DBは前提にしない（JetStream Stream/KVで完結）、サーバー内スケジューラは持たない（トリガーは外側で行う）。
+- 前提（Assumptions）：NATS JetStream が利用可能（信頼性の基盤）、実行保証は at-least-once（重複実行あり得る）、外部DBは前提にしない（JetStream Stream/KVで完結）、サーバー内スケジューラは持たない（トリガーは外側で行う）、運用は `nats-bootstrap` 連携を中核に置く、厳格マルチテナント分離を主目的にしない。
 
 #2.ユーザーの困りごと（Pain）
 - 分散実行したいが、NATS/JetStreamの運用やAPI詳細をアプリ利用者に持ち込ませたくない。
@@ -17,15 +17,26 @@
 - workerが「正常停止した」のか「途中で途絶した」のかが分からないと、障害判断と運用判断を誤りやすい。
 - 役目を終えたworkerを表示から外せないと、運用画面のノイズが増えて監視効率が落ちる。
 - 新しいタスクを追加するたびに、各workerでライブラリを個別インストールする運用は手間が大きく、更新漏れを起こしやすい。
+- 単体NATSとクラスタNATSで手順が分断されると、少人数運用でDay-2（増設/縮退/診断/退避/復旧）が回しづらい。
 
 #3.ターゲットと前提環境（詳細）
 - ターゲット：
   - Pyoco利用者（HTTPでrun投入/参照したい）
   - 運用者（NATS/workerを立ち上げ、落ちても復旧できる形にしたい）
+  - 単一組織の少人数運用チーム（同一CLI手順でDay-2運用を回したい）
 - 前提環境：
   - NATS JetStream 有効な NATS（単体〜クラスタ想定）
   - HTTP Gateway は水平スケール可能（状態の真実は JetStream 側）
   - worker はタグ（tag）単位でキューを pull し、複数タグは OR で扱う
+  - `nats-bootstrap` を併用し、`up/join/status/doctor/backup/restore/leave/down/service` を運用導線として使う
+- Fitするケース：
+  - 1チームで運用する社内基盤
+  - Docker中心で、導入コストを抑えて分散実行基盤を持ちたい
+  - 監視/診断を CLI と最小GUIで回したい
+- Fitしないケース：
+  - 厳格マルチテナント（強い境界制御や組織間分離が必須）
+  - 強い監査分離（組織横断での高度な統制証跡が必須）
+  - 超大規模SLA（高度な公平制御・隔離制御・大規模オーケストレーション）
 
 #4.採用する技術スタック（採用理由つき）
 - Python：Pyoco本体と親和性が高く、worker実装を最小で済ませられる。
@@ -53,7 +64,7 @@
 | F-15 | 最小GUIダッシュボード（一覧/詳細/workers/metrics） | 運用状況を1画面で把握したい | UC-4, UC-8, UC-9, UC-10, UC-11 |
 | F-16 | CLIの使い勝手改善（入力簡略化/エラー案内） | CLI操作時の試行錯誤を減らしたい | UC-12 |
 | F-17 | Dashboard文言の多言語化（ja/en） | 利用環境に応じて読みやすいUIで運用したい | UC-11 |
-| F-18 | server起動時のNATS同時起動（単体、opt-in） | ローカル運用の起動手順を短縮したい | UC-12 |
+| F-18 | `nats-bootstrap` 連携（server起動時NATS同時起動 + 運用CLI整合） | ローカル/クラスタの運用手順を揃えたい | UC-12 |
 | F-19 | run取消（cancel、best-effort） | 実行中runを運用判断で止めたい | UC-14 |
 | F-20 | wheelレジストリとタグ一致同期（Object Store） | workerごとの依存配布を一元化したい | UC-15 |
 | F-21 | wheel配布履歴（source/actor監査） | どこからアップロードされたか追跡したい | UC-15 |
@@ -72,7 +83,7 @@
 | UC-9 | 運用者/GUI | worker一覧を取得する | HTTP Gateway稼働、NATS利用可能 | `GET /workers` を呼ぶ（`scope`/`state`/`include_hidden` で表示条件を調整） | worker状態（`RUNNING`/`IDLE`/`STOPPED_GRACEFUL`/`DISCONNECTED`）付きで一覧を得られる | NATS不可なら取得失敗（503） |
 | UC-10 | 運用者/GUI | run詳細を継続監視する | run_idを保持、HTTP Gateway稼働 | `GET /runs/{run_id}/watch`（SSE）を呼ぶ（切断時は再接続） | スナップショット更新を継続受信できる | run_id不存在は404、NATS不可は503、順序はbest-effort |
 | UC-11 | 運用者/GUI | ダッシュボードで運用状態を俯瞰する | HTTP Gateway稼働 | `GET /` でダッシュボードを開く | run/worker/metricsを1画面で確認できる | 静的ファイル未配置時は404 |
-| UC-12 | 運用者/利用者 | CLIでrun投入/参照を最小手順で行う | CLI利用環境がある | `pyoco-client` / `pyoco-worker` / `pyoco-server` を使う | 必要最小の引数で投入・参照・監視ができる | 引数不正時は修正例付きで失敗理由が分かる |
+| UC-12 | 運用者/利用者 | CLIでrun投入/参照とNATS運用を最小手順で行う | CLI利用環境がある | `pyoco-client` / `pyoco-worker` / `pyoco-server` と `nats-bootstrap`（`up/join/status/doctor/backup/restore/leave/down/service`）を使う | 必要最小の手順で投入・参照・監視・運用作業ができる | `nats-bootstrap` のMVP制約（backup/restore の nats CLI 前提、leave/controller、down の pid前提）を持つ |
 | UC-13 | 運用者/GUI | worker表示を整理する | 対象workerが一覧に存在する | `PATCH /workers/{worker_id}` で `hidden` を切り替える | 運用上不要なworkerを非表示化/再表示できる | 対象workerが無ければ404 |
 | UC-14 | 運用者/利用者 | 実行中runを取消する | run_idを保持、HTTP Gateway/worker稼働 | `POST /runs/{run_id}/cancel` または `pyoco-client cancel --run-id <id>` を呼ぶ | runが `CANCELLING` を経て `CANCELLED` に収束する | 取消はbest-effort（legacy workerや境界外実行では即時停止を保証しない） |
 | UC-15 | 運用者/利用者 | wheelを配布し、対象workerだけ同期する | HTTP Gateway/worker稼働、Object Store利用可能 | `POST /wheels`（tags付き）で登録し、workerが定期同期する。`GET /wheels/history` で履歴を参照する | 同一パッケージはバージョンを必ず上げて登録され、workerタグと一致した最新版のみ同期・インストールされ、履歴で配布元を追跡できる | 同期/インストールはbest-effort（失敗時は再同期まで遅延） |
@@ -85,6 +96,7 @@
 - G-5: CLIでrun運用を低学習コストで実行できる（対応：UC-12）
 - G-6: 実行中runを安全に取消できる（対応：UC-14）
 - G-7: worker依存の配布を中央管理し、タグ一致で安全に展開できる（対応：UC-15）
+- G-8: `nats-bootstrap` 連携で単体/クラスタ運用の手順を揃え、小チームでもDay-2運用を継続できる（対応：UC-12）
 
 #8.基本レイヤー構造（Layering）
 | レイヤー | 役割 | 主な処理/データ流れ |
@@ -143,6 +155,9 @@
 - cursor：一覧差分取得の継続位置を示す不透明トークン。
 - watch（SSE）：run状態の更新を継続配信するHTTPストリーム。
 - Dashboard：運用者向けの最小GUI（read-only、状態監視用途）。
+- nats-bootstrap：NATS起動・参加・診断・退避/復旧を行う運用CLI群（`backup/restore` は `nats` CLI 前提）。
+- leave/controller（MVP制約）：`leave` は controller endpoint（`nats-bootstrap controller start` のendpoint）と `--confirm` が必要。`--stop-anyway` でもローカル停止はMVPでは実行しない。
+- down（pid前提）：`down` は `--confirm` と `./nats-server.pid` が必要。
 - wheel registry：JetStream Object Store に保持する配布用wheelの保管領域。
 - wheel version policy：同一パッケージを再配布する場合は、必ずバージョンを上げる（同一/過去バージョンは拒否）。
 - wheel tags：wheelの適用対象を表すタグ集合。worker tags と1つ以上一致した場合に同期対象になる。

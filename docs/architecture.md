@@ -2,6 +2,11 @@
 #1.アーキテクチャ概要（構成要素と責務）
 本システムは、プロトコル境界を明確に2面に分ける。
 
+設計中心（Positioning）：
+- `pyoco-server` は **Pyoco 本体ではなく**、社内システム向けの軽量分散実行バックエンド。
+- 運用対象は単一組織・少人数運用を主眼に置く。
+- 厳格マルチテナント分離や超大規模SLA基盤は設計中心に置かない（拡張余地は残す）。
+
 - Client <-> Server：HTTP
   - Pyoco利用者はHTTPのみを使い、NATSを意識しない（資格情報も持たない）。
 - Server <-> Worker：NATS JetStream
@@ -25,6 +30,7 @@
   - `pyoco-server`：HTTP Gatewayを起動する
   - `pyoco-worker`：workerを起動する（flow_resolverは必要時のみ指定）
   - `pyoco-server-admin`：API key 管理（create/list/revoke）
+  - `nats-bootstrap`：NATS運用（`up/join/status/doctor/backup/restore/leave/down/service`）
 - Worker
   - tag 単位の durable consumer から pull でジョブを取得（複数tagは OR）
   - Pyoco Engine で run を実行し、Traceを KV スナップショットへ反映
@@ -507,7 +513,7 @@ Pyoco Engine -> TraceBackend(NatsKvTraceBackend) -> JetStream KV
 | wheel history | wheel配布履歴の参照 | `GET /wheels/history` |
 | wheel sync status | workerの同期/インストール成否と互換外skip | `GET /workers` の `wheel_sync` / workerログ（`wheel sync failed` など） |
 | DLQ | 失敗診断 | JetStream（PYOCO_DLQ） |
-| doctor/status/debug | 該当なし（v0では専用コマンド未提供） | - |
+| doctor/status/debug | pyoco-server専用のdoctor/status/debugは未提供。NATS運用診断は `nats-bootstrap status/doctor` を使う | CLI（`uv run nats-bootstrap status` / `uv run nats-bootstrap doctor`） |
 
 ### ログ仕様（提案：JSON Lines）
 v0では、運用上の診断容易性を優先し、HTTP Gateway / worker は stdout に JSON Lines を出力する。
@@ -575,10 +581,17 @@ v0では、運用上の診断容易性を優先し、HTTP Gateway / worker は s
   - HTTP Gateway：uvicornで起動（`pyoco_server.http_api:create_app --factory`）
   - Worker：Pythonプロセスとして起動（例：`examples/run_worker.py` 等）
   - 依存配布：wheel registry（Object Store）を使い、workerが差分同期して更新する（opt-in）
+  - NATS運用：`nats-bootstrap` を利用して単体/クラスタ運用を行う
 - 更新方針：
   - on-wire契約（HTTP/NATS/KV/DLQ）は `docs/spec.md` を正とし、原則は後方互換（追加はOK、破壊は慎重）。
   - wheel同期は起動時/次回poll前に実行し、実行中runの途中では更新しない。
   - 0.xでは破壊的変更が起こり得るため、明示する。
+- `nats-bootstrap` 連携の運用制約（現行）：
+  - `backup/restore` は `nats` CLI 前提（`--nats-cli-path` で上書き可能）
+  - `leave` は controller endpoint（`nats-bootstrap controller start` のendpoint）と `--confirm` が必要
+  - `leave --stop-anyway` は controller 不達時の成功扱いを許容するが、MVPではローカル停止を実施しない
+  - `controller` は現状 `start` 操作のみ
+  - `down` は `--confirm` + `./nats-server.pid` を前提にする
 
 #13.CLI：コマンド体系／引数／出力／exit code
 提供コマンド（v0）：
@@ -586,6 +599,7 @@ v0では、運用上の診断容易性を優先し、HTTP Gateway / worker は s
 - `pyoco-worker`（worker起動）
 - `pyoco-client`（run運用CLI）
 - `pyoco-server-admin`（API key管理）
+- `nats-bootstrap`（NATS運用CLI）
 
 `pyoco-client` の主なsubcommand：
 - `submit` / `submit-yaml` / `get` / `tasks` / `list` / `list-vnext` / `watch` / `cancel` / `workers` / `metrics` / `wheels` / `wheel-history` / `wheel-upload` / `wheel-delete`
@@ -601,6 +615,7 @@ CLI UX方針（v0.4実装）：
 - `wheel-upload` は `--wheel-file` を必須にし、任意で `--tags` / `--replace` / `--no-replace` を提供する
 - `wheel-history` は `--limit` / `--wheel-name` / `--action upload|delete` を提供する
 - `pyoco-worker` は `--wheel-sync` / `--wheel-sync-dir` / `--wheel-sync-interval-sec` / `--wheel-install-timeout-sec` を提供する
+- `nats-bootstrap` は `up/join/status/doctor/backup/restore/leave/down/service/controller` を提供する（現行の controller は `start` のみ）
 
 exit code（方針）：
 - `0`：成功
