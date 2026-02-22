@@ -450,7 +450,7 @@ wheels = [
 
 [[package]]
 name = "pyoco"
-version = "0.6.2"
+version = "0.7.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fastapi" },
@@ -459,14 +459,14 @@ dependencies = [
     { name = "pyyaml" },
     { name = "uvicorn" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/fa/18/b43cf166ff03f8f6a796bc309e36d27f7bbba5489c13ca82bac0dbe351af/pyoco-0.6.2.tar.gz", hash = "sha256:8e4d7fc3ab23e77900f3e6a852dfd0ace82e898c96f76ef9682fb0c6109227c0", size = 49161, upload-time = "2026-02-06T12:14:06.417Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/60/7a/0b698116e1e57988578c152e52cabc5b9fca8aa3c3b3dece393544a6dafa/pyoco-0.7.1.tar.gz", hash = "sha256:b8f52fa8c7f1d27cf856b0737090683e7caac2e8bf7d72fe63d1fa891ba4051f", size = 57666, upload-time = "2026-02-22T02:11:42.945Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/00/72/8f8d62e97380a911d23015f42193e6466abc94c8a79986b937179c866810/pyoco-0.6.2-py3-none-any.whl", hash = "sha256:81c0a253f0f0667860b4cfbe1fc5dc77e05e9ecf685fc76a65f047f7379f8cd5", size = 50798, upload-time = "2026-02-06T12:14:04.047Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/1c/39443e617cd767f7be61d8f746d4699cf98ca134bf39331c049a274d244b/pyoco-0.7.1-py3-none-any.whl", hash = "sha256:e09e2d173d9a57386fb8c18e69e3b7c938cc14467a218521ab30974a2561e784", size = 60718, upload-time = "2026-02-22T02:11:39.802Z" },
 ]
 
 [[package]]
 name = "pyoco-server"
-version = "0.5.0"
+version = "0.5.1"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

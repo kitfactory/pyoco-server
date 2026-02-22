@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import json
 import sys
+import zipfile
+from email.parser import Parser
 from pathlib import Path
 from typing import Any, Optional
 
@@ -128,6 +131,146 @@ def _parse_tags(raw: Optional[str]) -> Optional[list[str]]:
     return tags or None
 
 
+def _find_dist_info_member(members: list[str], filename: str) -> Optional[str]:
+    suffix = f".dist-info/{filename}"
+    hits = sorted([member for member in members if member.endswith(suffix)])
+    return hits[0] if hits else None
+
+
+def _read_zip_text(zf: zipfile.ZipFile, member: str) -> str:
+    return zf.read(member).decode("utf-8", errors="replace")
+
+
+def _count_entry_points(entry_points_text: str) -> int:
+    parser = configparser.ConfigParser(interpolation=None)
+    parser.optionxform = str
+    parser.read_string(entry_points_text)
+    return sum(len(list(parser.options(section))) for section in parser.sections())
+
+
+def _check_wheel_preflight(
+    wheel_path: Path,
+    *,
+    require_entry_points: bool,
+    require_usage_doc: bool,
+) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    try:
+        with zipfile.ZipFile(wheel_path, "r") as zf:
+            members = list(zf.namelist())
+            metadata_member = _find_dist_info_member(members, "METADATA")
+            if not metadata_member:
+                errors.append("missing dist-info/METADATA")
+                return errors, warnings
+
+            metadata_text = _read_zip_text(zf, metadata_member)
+            metadata = Parser().parsestr(metadata_text)
+            pkg_name = str(metadata.get("Name") or "").strip()
+            pkg_version = str(metadata.get("Version") or "").strip()
+            summary = str(metadata.get("Summary") or "").strip()
+            description = str(metadata.get_payload() or "").strip()
+
+            if not pkg_name:
+                errors.append("METADATA Name is missing")
+            if not pkg_version:
+                errors.append("METADATA Version is missing")
+            if not summary:
+                warnings.append("METADATA Summary is empty")
+
+            project_urls = [str(v).strip() for v in list(metadata.get_all("Project-URL") or []) if str(v).strip()]
+            has_docs_url = False
+            for raw in project_urls:
+                label, _, url = raw.partition(",")
+                label_norm = label.strip().lower()
+                if label_norm in {"documentation", "docs", "doc", "usage"} and url.strip():
+                    has_docs_url = True
+                    break
+
+            has_usage_doc = len(description) >= 80 or has_docs_url
+            if require_usage_doc and not has_usage_doc:
+                errors.append(
+                    "usage documentation is missing (need METADATA description>=80 chars or Project-URL: Documentation,...)"
+                )
+            elif not has_usage_doc:
+                warnings.append("usage documentation seems missing")
+
+            entry_points_member = _find_dist_info_member(members, "entry_points.txt")
+            entry_point_count = 0
+            if entry_points_member:
+                try:
+                    entry_point_count = _count_entry_points(_read_zip_text(zf, entry_points_member))
+                except configparser.Error:
+                    errors.append("dist-info/entry_points.txt format is invalid")
+
+            if require_entry_points and entry_point_count <= 0:
+                errors.append("entry_points are missing (dist-info/entry_points.txt)")
+            elif entry_point_count <= 0:
+                warnings.append("entry_points are missing")
+    except zipfile.BadZipFile:
+        errors.append("wheel file is not a valid zip archive")
+
+    return errors, warnings
+
+
+def _run_wheel_preflight(args: argparse.Namespace, wheel_path: Path) -> None:
+    mode = str(args.preflight or "strict").strip().lower()
+    if mode == "off":
+        return
+
+    errors, warnings = _check_wheel_preflight(
+        wheel_path,
+        require_entry_points=not bool(args.allow_no_entry_points),
+        require_usage_doc=not bool(args.allow_missing_usage_doc),
+    )
+    for warning in warnings:
+        sys.stderr.write(f"[pyoco-client][preflight][warn] {warning}\n")
+
+    if errors and mode == "warn":
+        for err in errors:
+            sys.stderr.write(f"[pyoco-client][preflight][warn] {err}\n")
+        return
+
+    if errors:
+        reason = "; ".join(errors)
+        raise _CliInputError(
+            f"{_ERR_ID}: {_ERR_MSG}\n"
+            f"- reason: wheel preflight failed: {reason}\n"
+            "- hint: fix wheel metadata/entry_points or use --preflight warn/off"
+        )
+
+
+def _worker_tags_text(item: dict[str, Any]) -> str:
+    raw = item.get("tags")
+    if not isinstance(raw, list):
+        return "-"
+    tags = [str(tag).strip() for tag in raw if str(tag).strip()]
+    return ",".join(tags) if tags else "-"
+
+
+def _worker_plugins(item: dict[str, Any]) -> list[dict[str, str]]:
+    wheel_sync = item.get("wheel_sync")
+    if not isinstance(wheel_sync, dict):
+        return []
+    installed = wheel_sync.get("installed_wheels")
+    if not isinstance(installed, list):
+        return []
+
+    out: list[dict[str, str]] = []
+    for raw in installed:
+        if not isinstance(raw, dict):
+            continue
+        out.append(
+            {
+                "package_name": str(raw.get("package_name") or ""),
+                "package_version": str(raw.get("package_version") or ""),
+                "wheel_name": str(raw.get("wheel_name") or ""),
+            }
+        )
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = _ClientArgumentParser(prog="pyoco-client")
     p.add_argument("--server", default="http://127.0.0.1:8000")
@@ -193,7 +336,12 @@ def _build_parser() -> argparse.ArgumentParser:
     c.add_argument("--wait", action="store_true", help="wait until terminal status")
     c.add_argument("--timeout-sec", type=int, default=30)
 
-    sub.add_parser("workers", help="Get active workers")
+    wk = sub.add_parser("workers", help="Get worker registry")
+    wk.add_argument("--scope", choices=["active", "all"], default="active")
+    wk.add_argument("--state", choices=["RUNNING", "IDLE", "STOPPED_GRACEFUL", "DISCONNECTED"], default=None)
+    wk.add_argument("--include-hidden", action="store_true")
+    wk.add_argument("--limit", type=int, default=None)
+    wk.add_argument("--output", choices=["json", "table", "plugins"], default="json")
     sub.add_parser("wheels", help="List wheel registry")
     wh = sub.add_parser("wheel-history", help="List wheel upload/delete history")
     wh.add_argument("--limit", type=int, default=100)
@@ -204,6 +352,9 @@ def _build_parser() -> argparse.ArgumentParser:
     wu.add_argument("--tags", default=None, help="comma-separated tags")
     wu.add_argument("--replace", dest="replace", action="store_true", default=True)
     wu.add_argument("--no-replace", dest="replace", action="store_false")
+    wu.add_argument("--preflight", choices=["strict", "warn", "off"], default="strict")
+    wu.add_argument("--allow-no-entry-points", action="store_true")
+    wu.add_argument("--allow-missing-usage-doc", action="store_true")
     wd = sub.add_parser("wheel-delete", help="Delete a wheel from registry")
     wd.add_argument("--name", required=True, help="wheel filename")
     sub.add_parser("metrics", help="Get metrics text")
@@ -221,6 +372,56 @@ def _to_run_table_rows(items: list[dict[str, Any]]) -> list[list[str]]:
             str(item.get("updated_at", "-")),
         ]
         rows.append(row)
+    return rows
+
+
+def _to_worker_table_rows(items: list[dict[str, Any]]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for item in items:
+        plugins = _worker_plugins(item)
+        plugin_labels: list[str] = []
+        for plugin in plugins[:3]:
+            package_name = plugin.get("package_name") or ""
+            package_version = plugin.get("package_version") or ""
+            wheel_name = plugin.get("wheel_name") or "-"
+            if package_name and package_version:
+                plugin_labels.append(f"{package_name}@{package_version}")
+            else:
+                plugin_labels.append(wheel_name)
+        if len(plugins) > 3:
+            plugin_labels.append(f"+{len(plugins) - 3}")
+        row = [
+            str(item.get("worker_id") or "-"),
+            str(item.get("state") or "-"),
+            _worker_tags_text(item),
+            str(len(plugins)),
+            ", ".join(plugin_labels) if plugin_labels else "-",
+        ]
+        rows.append(row)
+    return rows
+
+
+def _to_worker_plugin_rows(items: list[dict[str, Any]]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for item in items:
+        worker_id = str(item.get("worker_id") or "-")
+        state = str(item.get("state") or "-")
+        tags = _worker_tags_text(item)
+        plugins = _worker_plugins(item)
+        if not plugins:
+            rows.append([worker_id, state, tags, "-", "-", "-"])
+            continue
+        for plugin in plugins:
+            rows.append(
+                [
+                    worker_id,
+                    state,
+                    tags,
+                    str(plugin.get("package_name") or "-"),
+                    str(plugin.get("package_version") or "-"),
+                    str(plugin.get("wheel_name") or "-"),
+                ]
+            )
     return rows
 
 
@@ -383,7 +584,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0
 
         if args.command == "workers":
-            _print_json(client.get_workers())
+            out = client.get_workers(
+                scope=args.scope,
+                state=args.state,
+                include_hidden=(True if args.include_hidden else None),
+                limit=args.limit,
+            )
+            if args.output == "table":
+                _print_table(
+                    headers=["worker_id", "state", "tags", "plugins", "plugin_preview"],
+                    rows=_to_worker_table_rows(out),
+                )
+            elif args.output == "plugins":
+                _print_table(
+                    headers=["worker_id", "state", "tags", "package", "version", "wheel_name"],
+                    rows=_to_worker_plugin_rows(out),
+                )
+            else:
+                _print_json(out)
             return 0
 
         if args.command == "wheels":
@@ -402,6 +620,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if args.command == "wheel-upload":
             wheel_path = Path(args.wheel_file)
+            _run_wheel_preflight(args, wheel_path)
             data = wheel_path.read_bytes()
             out = client.upload_wheel(
                 filename=wheel_path.name,

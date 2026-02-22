@@ -172,4 +172,8 @@ uv run pyoco-worker --nats-url nats://127.0.0.1:4222 --tags hello --worker-id w1
 uv run pyoco-client --server http://127.0.0.1:8000 wheel-upload --wheel-file dist/my_task_ext-0.1.0-py3-none-any.whl --tags hello,linux
 uv run pyoco-client --server http://127.0.0.1:8000 wheels
 uv run pyoco-client --server http://127.0.0.1:8000 wheel-history --limit 20
+uv run pyoco-client --server http://127.0.0.1:8000 workers --output table
+uv run pyoco-client --server http://127.0.0.1:8000 workers --scope all --output plugins
 ```
+
+`wheel-upload` は既定で preflight（`strict`）を実行し、wheel の `entry_points` と使用説明（METADATA）を確認します。必要に応じて `--preflight warn|off` や `--allow-no-entry-points` を指定してください。

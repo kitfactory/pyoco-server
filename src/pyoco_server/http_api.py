@@ -286,7 +286,7 @@ def create_app() -> FastAPI:
 
     configure_logging(service="pyoco-server:http")
     config = config_from_env()
-    app = FastAPI(title="pyoco-server (HTTP gateway)", version="0.5.0")
+    app = FastAPI(title="pyoco-server (HTTP gateway)", version="0.5.1")
     logger = logging.getLogger("pyoco_server.http_api")
     static_dir = Path(__file__).resolve().parent / "static"
     dashboard_lang = _resolve_dashboard_lang(config)

@@ -298,6 +298,7 @@ const state = {
   watchTerminal: false,
   pollingRuns: false,
   pollingWorkers: false,
+  pendingWorkersRefresh: false,
   pollingMetrics: false,
   metricsBaseline: null,
   latestMetrics: null,
@@ -1282,6 +1283,7 @@ async function refreshRunsDelta() {
 
 async function refreshWorkers() {
   if (state.pollingWorkers) {
+    state.pendingWorkersRefresh = true;
     return;
   }
   state.pollingWorkers = true;
@@ -1295,6 +1297,18 @@ async function refreshWorkers() {
     setError(String(err?.message || err));
   } finally {
     state.pollingWorkers = false;
+    if (state.pendingWorkersRefresh) {
+      state.pendingWorkersRefresh = false;
+      void refreshWorkers();
+    }
+  }
+}
+
+async function refreshWorkersAndWait(timeoutMs = 3000) {
+  await refreshWorkers();
+  const deadline = Date.now() + Math.max(100, Number(timeoutMs) || 3000);
+  while ((state.pollingWorkers || state.pendingWorkersRefresh) && Date.now() < deadline) {
+    await sleep(40);
   }
 }
 
@@ -1405,7 +1419,7 @@ function bindEvents() {
       const currentlyHidden = btn.dataset.hidden === "1";
       try {
         await setWorkerHidden(workerId, !currentlyHidden);
-        await refreshWorkers();
+        await refreshWorkersAndWait();
         setError("");
       } catch (err) {
         setError(String(err?.message || err));

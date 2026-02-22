@@ -3,11 +3,42 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+import zipfile
 
 import pytest
 import httpx
 
 from pyoco_server import client_cli
+
+
+def _write_test_wheel(
+    path: Path,
+    *,
+    with_entry_points: bool = True,
+    with_usage_doc: bool = True,
+) -> None:
+    dist_info = "demo_ext-0.1.0.dist-info"
+    metadata_lines = [
+        "Metadata-Version: 2.1",
+        "Name: demo_ext",
+        "Version: 0.1.0",
+        "Summary: demo extension",
+    ]
+    if with_usage_doc:
+        metadata_lines.extend(
+            [
+                "Project-URL: Documentation, https://example.com/demo_ext",
+                "",
+                "This package provides demo extension usage guidance for operators.",
+            ]
+        )
+    metadata_text = "\n".join(metadata_lines) + "\n"
+
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{dist_info}/METADATA", metadata_text)
+        zf.writestr(f"{dist_info}/WHEEL", "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+        if with_entry_points:
+            zf.writestr(f"{dist_info}/entry_points.txt", "[console_scripts]\ndemo-ext = demo_ext.cli:main\n")
 
 
 class _FakeClient:
@@ -94,9 +125,36 @@ class _FakeClient:
         status = "CANCELLED" if wait else "CANCELLING"
         return {"run_id": run_id, "status": status}
 
-    def get_workers(self):
-        self.calls.append(("get_workers", {}))
-        return [{"worker_id": "w1"}]
+    def get_workers(
+        self,
+        *,
+        scope=None,
+        state=None,
+        include_hidden=None,
+        limit=None,
+    ):
+        self.calls.append(
+            (
+                "get_workers",
+                {"scope": scope, "state": state, "include_hidden": include_hidden, "limit": limit},
+            )
+        )
+        return [
+            {
+                "worker_id": "w1",
+                "state": "IDLE",
+                "tags": ["cpu", "linux"],
+                "wheel_sync": {
+                    "installed_wheels": [
+                        {
+                            "package_name": "demo_ext",
+                            "package_version": "0.1.0",
+                            "wheel_name": "demo_ext-0.1.0-py3-none-any.whl",
+                        }
+                    ]
+                },
+            }
+        ]
 
     def list_wheels(self):
         self.calls.append(("list_wheels", {}))
@@ -265,6 +323,45 @@ def test_client_cli_workers_and_metrics(monkeypatch: pytest.MonkeyPatch, capsys:
     assert "pyoco_workers_alive_total 1" in out_metrics
 
 
+def test_client_cli_workers_table_output(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    _reset_fake()
+    monkeypatch.setattr(client_cli, "PyocoHttpClient", _FakeClient)
+    rc = client_cli.main(["workers", "--output", "table"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "worker_id" in out
+    assert "plugin_preview" in out
+    assert "demo_ext@0.1.0" in out
+
+
+def test_client_cli_workers_plugins_output_with_filters(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _reset_fake()
+    monkeypatch.setattr(client_cli, "PyocoHttpClient", _FakeClient)
+    rc = client_cli.main(
+        [
+            "workers",
+            "--scope",
+            "all",
+            "--state",
+            "IDLE",
+            "--include-hidden",
+            "--limit",
+            "10",
+            "--output",
+            "plugins",
+        ]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "wheel_name" in out
+    assert "demo_ext-0.1.0-py3-none-any.whl" in out
+    call = _FakeClient.instances[-1].calls[0]
+    assert call[0] == "get_workers"
+    assert call[1] == {"scope": "all", "state": "IDLE", "include_hidden": True, "limit": 10}
+
+
 def test_client_cli_wheel_upload_with_tags(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -273,7 +370,7 @@ def test_client_cli_wheel_upload_with_tags(
     _reset_fake()
     monkeypatch.setattr(client_cli, "PyocoHttpClient", _FakeClient)
     wheel = tmp_path / "abc-0.1.0-py3-none-any.whl"
-    wheel.write_bytes(b"123")
+    _write_test_wheel(wheel)
 
     rc = client_cli.main(["wheel-upload", "--wheel-file", str(wheel), "--tags", "cpu,gpu"])
     out = capsys.readouterr().out.strip()
@@ -284,6 +381,41 @@ def test_client_cli_wheel_upload_with_tags(
     call = _FakeClient.instances[-1].calls[0]
     assert call[0] == "upload_wheel"
     assert call[1]["tags"] == ["cpu", "gpu"]
+
+
+def test_client_cli_wheel_upload_preflight_missing_entry_points(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_fake()
+    monkeypatch.setattr(client_cli, "PyocoHttpClient", _FakeClient)
+    wheel = tmp_path / "abc-0.1.0-py3-none-any.whl"
+    _write_test_wheel(wheel, with_entry_points=False)
+
+    rc = client_cli.main(["wheel-upload", "--wheel-file", str(wheel)])
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "wheel preflight failed" in err
+    assert "entry_points are missing" in err
+    assert _FakeClient.instances[-1].calls == []
+
+
+def test_client_cli_wheel_upload_preflight_warn_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_fake()
+    monkeypatch.setattr(client_cli, "PyocoHttpClient", _FakeClient)
+    wheel = tmp_path / "abc-0.1.0-py3-none-any.whl"
+    _write_test_wheel(wheel, with_entry_points=False, with_usage_doc=False)
+
+    rc = client_cli.main(["wheel-upload", "--wheel-file", str(wheel), "--preflight", "warn"])
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    body = json.loads(out)
+    assert body["name"] == wheel.name
 
 
 def test_client_cli_wheel_history(

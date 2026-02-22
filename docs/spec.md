@@ -723,9 +723,10 @@ Base URL 例：`http://127.0.0.1:8000`
 - `pyoco-client` の主要入力（v0.4）：
   - `submit` の params は `--params-file`（JSON/YAML object）/`--params`（JSON object）/`--param key=value`（複数可）を併用できる（後勝ち）
   - `list` / `list-vnext` は `--output json|table`
+  - `workers` は `--scope active|all` / `--state RUNNING|IDLE|STOPPED_GRACEFUL|DISCONNECTED` / `--include-hidden` / `--limit` を受け付け、`--output json|table|plugins` で表示を切り替えられる
   - `watch` は `--output json|status`
   - `cancel` は `--run-id`（required）と任意の `--wait` / `--timeout-sec` を持つ（`--wait` 指定時は終端収束まで待機）
-  - wheel管理は `wheels` / `wheel-history --limit 100 [--wheel-name x.whl] [--action upload|delete]` / `wheel-upload --wheel-file <path> [--tags cpu,linux] [--replace|--no-replace]` / `wheel-delete --name <wheel.whl>`
+  - wheel管理は `wheels` / `wheel-history --limit 100 [--wheel-name x.whl] [--action upload|delete]` / `wheel-upload --wheel-file <path> [--tags cpu,linux] [--replace|--no-replace] [--preflight strict|warn|off] [--allow-no-entry-points] [--allow-missing-usage-doc]` / `wheel-delete --name <wheel.whl>`
 - 失敗時（v0）：
   - 引数検証失敗は exit code `1` で終了し、stderrに入力修正例を表示する
   - `pyoco-server up --with-nats-bootstrap` 指定時は、`nats-bootstrap` 不在/ポート競合/起動タイムアウトで exit code `1`

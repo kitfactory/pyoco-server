@@ -6,7 +6,7 @@
 
 ## 現在地（必ず更新）
 - 現在フェーズ: Phase 4（v0.4：YAML（flow.yaml）投入の運用I/F）
-- 現在のバージョン（実装の区切り）: v0.5.0
+- 現在のバージョン（実装の区切り）: v0.5.1
 - 今回スコープ（1〜5行）:
   - pyoco 0.6.2（single-flow: `flow:`）に合わせ、`flow.yaml`（YAML）を multipart で投入できるようにする（`POST /runs/yaml`）
   - params は `flow.defaults` を正本とし、HTTP側の上書きI/Fは初期は提供しない
@@ -18,6 +18,7 @@
   - `NatsBackendConfig.from_env()` で `.env` 自動読込に対応（`PYOCO_LOAD_DOTENV` / `PYOCO_ENV_FILE`）
   - `pyoco-server up --with-nats-bootstrap` で単体NATSを同時起動可能（任意依存、未導入時は明示エラー）
   - CLIの使い勝手改善を反映済み（`submit` の入力簡略化、`list/watch` の出力モード、修正例付きエラー表示）
+  - `pyoco-client wheel-upload` に client-side preflight を追加（既定 `strict`。`entry_points` と使用説明の検査）
   - 完了スコープ：Workers運用可視化の拡張（停止種別の区別、手動hide、運用表示改善）
   - run取消（`POST /runs/{run_id}/cancel`、`CANCELLING -> CANCELLED`、best-effort、`PYOCO_CANCEL_GRACE_PERIOD_SEC`）を実装し、HTTP/worker/CLI/Dashboard/E2E を反映済み
   - wheelレジストリ（JetStream Object Store）を追加し、`/wheels` API（list/upload/download/delete/history）と worker の wheel 同期・差分インストール（opt-in）を実装（wheelタグとworkerタグの一致で配布）
