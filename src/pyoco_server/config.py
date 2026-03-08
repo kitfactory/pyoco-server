@@ -86,6 +86,8 @@ class NatsBackendConfig:
 
     # Latest run status (JetStream KV)
     runs_kv_bucket: str = "pyoco_runs"
+    workflow_bundles_kv_bucket: str = "pyoco_workflow_bundles"
+    run_relations_kv_bucket: str = "pyoco_run_relations"
 
     # Worker liveness (JetStream KV with TTL)
     workers_kv_bucket: str = "pyoco_workers"
@@ -145,6 +147,13 @@ class NatsBackendConfig:
     # flow.yaml は JetStream の1メッセージとして投入するため、サイズ上限を設ける。
     # Since flow.yaml is carried inside a single JetStream message, keep it bounded.
     workflow_yaml_max_bytes: int = 256 * 1024  # 256 KiB
+    workflow_bundle_max_bytes: int = 256 * 1024  # 256 KiB
+    spawn_requires_approval: bool = True
+    spawn_max_child_runs: int = 100
+    spawn_max_parallel_child_runs: int = 8
+    spawn_child_tag: str = ""
+    spawn_timeout_sec: float = 3600.0
+    spawn_poll_interval_sec: float = 0.2
 
     # Dashboard locale policy:
     # - "auto": derive from server locale.
@@ -205,6 +214,14 @@ class NatsBackendConfig:
         return cls(
             nats_url=_env_raw("PYOCO_NATS_URL", cls.nats_url) or cls.nats_url,
             runs_kv_bucket=_env_raw("PYOCO_RUNS_KV_BUCKET", cls.runs_kv_bucket) or cls.runs_kv_bucket,
+            workflow_bundles_kv_bucket=_env_raw(
+                "PYOCO_WORKFLOW_BUNDLES_KV_BUCKET", cls.workflow_bundles_kv_bucket
+            )
+            or cls.workflow_bundles_kv_bucket,
+            run_relations_kv_bucket=_env_raw(
+                "PYOCO_RUN_RELATIONS_KV_BUCKET", cls.run_relations_kv_bucket
+            )
+            or cls.run_relations_kv_bucket,
             workers_kv_bucket=_env_raw("PYOCO_WORKERS_KV_BUCKET", cls.workers_kv_bucket)
             or cls.workers_kv_bucket,
             work_subject_prefix=_env_raw("PYOCO_WORK_SUBJECT_PREFIX", cls.work_subject_prefix)
@@ -266,6 +283,21 @@ class NatsBackendConfig:
             ),
             workflow_yaml_max_bytes=_env_int(
                 "PYOCO_WORKFLOW_YAML_MAX_BYTES", cls.workflow_yaml_max_bytes
+            ),
+            workflow_bundle_max_bytes=_env_int(
+                "PYOCO_WORKFLOW_BUNDLE_MAX_BYTES", cls.workflow_bundle_max_bytes
+            ),
+            spawn_requires_approval=_env_bool(
+                "PYOCO_SPAWN_REQUIRES_APPROVAL", cls.spawn_requires_approval
+            ),
+            spawn_max_child_runs=_env_int("PYOCO_SPAWN_MAX_CHILD_RUNS", cls.spawn_max_child_runs),
+            spawn_max_parallel_child_runs=_env_int(
+                "PYOCO_SPAWN_MAX_PARALLEL_CHILD_RUNS", cls.spawn_max_parallel_child_runs
+            ),
+            spawn_child_tag=_env_raw("PYOCO_SPAWN_CHILD_TAG", cls.spawn_child_tag) or cls.spawn_child_tag,
+            spawn_timeout_sec=_env_float("PYOCO_SPAWN_TIMEOUT_SEC", cls.spawn_timeout_sec),
+            spawn_poll_interval_sec=_env_float(
+                "PYOCO_SPAWN_POLL_INTERVAL_SEC", cls.spawn_poll_interval_sec
             ),
             dashboard_lang=_env_raw("PYOCO_DASHBOARD_LANG", cls.dashboard_lang) or cls.dashboard_lang,
         )

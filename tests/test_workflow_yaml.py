@@ -3,8 +3,10 @@ import hashlib
 import pytest
 
 from pyoco_server.workflow_yaml import (
+    BundleTaskConfig,
     WorkflowYamlValidationError,
     extract_flow_defaults,
+    parse_workflow_bundle_bytes,
     parse_workflow_yaml_bytes,
 )
 
@@ -64,4 +66,63 @@ flow:
     with pytest.raises(WorkflowYamlValidationError) as exc:
         parse_workflow_yaml_bytes(raw, require_flow=True)
     assert exc.value.reason in {"unsupported_key_flows", "unsupported_key_discovery"}
+
+
+def test_parse_workflow_bundle_bytes_ok_and_detects_approval():
+    raw = b"""\
+version: 1
+workflows:
+  study:
+    tasks:
+      prepare:
+        callable: pyoco_server._workflow_test_tasks:add_one
+      run_child:
+        spawn: trial
+        inputs:
+          x: $node.prepare.output
+    flow:
+      graph: |
+        prepare >> run_child
+  trial:
+    tasks:
+      add_one:
+        callable: pyoco_server._workflow_test_tasks:add_one
+      to_text:
+        callable: pyoco_server._workflow_test_tasks:to_text
+    flow:
+      graph: |
+        add_one >> to_text
+submit:
+  entry_workflow: study
+  inputs:
+    x: 1
+"""
+
+    parsed = parse_workflow_bundle_bytes(raw)
+    assert parsed.sha256 == hashlib.sha256(raw).hexdigest()
+    assert parsed.approval_required is True
+    assert parsed.submit.entry_workflow == "study"
+    assert parsed.workflows["study"].reachable_spawn_task_names == ("run_child",)
+    assert isinstance(parsed.workflows["study"].tasks["run_child"], BundleTaskConfig)
+
+
+def test_parse_workflow_bundle_bytes_rejects_invalid_spawn_reference():
+    raw = b"""\
+version: 1
+workflows:
+  study:
+    tasks:
+      run_child:
+        spawn: missing
+    flow:
+      graph: |
+        run_child
+submit:
+  entry_workflow: study
+  inputs: {}
+"""
+
+    with pytest.raises(WorkflowYamlValidationError) as exc:
+        parse_workflow_bundle_bytes(raw)
+    assert exc.value.reason.startswith("unknown_spawn_target")
 

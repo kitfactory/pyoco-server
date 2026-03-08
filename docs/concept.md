@@ -2,7 +2,7 @@
 #1.概要（Overview）（先頭固定）
 - 作るもの（What）：Pyoco **本体ではなく**、Pyoco のワークフロー実行（run）を HTTP（Client-Server）と NATS JetStream（Server-Worker）で分散実行するための軽量バックエンド。
 - 解決すること（Why）：Pyoco 利用者が NATS を意識せずに「run投入」「run/タスク状態参照」をできるようにし、導入と運用の負担を最小化する。
-- できること（主要機能の要約）：HTTPでrun投入、KVスナップショットで状態参照、タスク状態参照、一覧/フィルタ、worker運用可視化（状態区別・手動hide・表示制御）、DLQで診断、長時間runの再配送防止（in_progress ACK）と心拍、運用向けエンドポイント（/metrics, /workers）、GUI向けの最小状態管理I/F（一覧差分取得・run監視SSE）、CLI（server/worker/client/admin）による運用操作、run取消（cancel、best-effort）、wheelレジストリとworkerタグ一致での依存配布、wheel配布履歴（アップロード元情報付き）の参照。
+- できること（主要機能の要約）：HTTPでrun投入、KVスナップショットで状態参照、タスク状態参照、一覧/フィルタ、worker運用可視化（状態区別・手動hide・表示制御）、DLQで診断、長時間runの再配送防止（in_progress ACK）と心拍、運用向けエンドポイント（/metrics, /workers）、GUI向けの最小状態管理I/F（一覧差分取得・run監視SSE）、CLI（server/worker/client/admin）による運用操作、run取消（cancel、best-effort）、wheelレジストリとworkerタグ一致での依存配布、wheel配布履歴（アップロード元情報付き）の参照、1枚YAML bundleによる親子workflow実行（spawn、承認付き）の将来拡張。
 - 使いどころ（When/Where）：単一組織の社内システムで、Pyoco flow を複数ノード（複数worker）で実行したいが、DBや巨大オーケストレータは持ち込みたくない小規模チーム。
 - 成果物（Outputs）：HTTP Gateway（FastAPI）、Worker（Pyoco Engine実行）、JetStreamリソース定義（Stream/KV/DLQ）、PythonライブラリAPI、Quickstart/例、運用向け最小GUI（read-only）。
 - 前提（Assumptions）：NATS JetStream が利用可能（信頼性の基盤）、実行保証は at-least-once（重複実行あり得る）、外部DBは前提にしない（JetStream Stream/KVで完結）、サーバー内スケジューラは持たない（トリガーは外側で行う）、運用は `nats-bootstrap` 連携を中核に置く、厳格マルチテナント分離を主目的にしない。
@@ -18,6 +18,8 @@
 - 役目を終えたworkerを表示から外せないと、運用画面のノイズが増えて監視効率が落ちる。
 - 新しいタスクを追加するたびに、各workerでライブラリを個別インストールする運用は手間が大きく、更新漏れを起こしやすい。
 - 単体NATSとクラスタNATSで手順が分断されると、少人数運用でDay-2（増設/縮退/診断/退避/復旧）が回しづらい。
+- Study -> Trial のように、workflow 実行中に別 workflow を安全に起動したいが、外部参照や再帰的なジョブ爆発は避けたい。
+- 親子 run の関係、承認有無、bundle 由来を後から追跡できないと、研究・開発用途で再現性と監査性が不足する。
 
 #3.ターゲットと前提環境（詳細）
 - ターゲット：
@@ -68,6 +70,10 @@
 | F-19 | run取消（cancel、best-effort） | 実行中runを運用判断で止めたい | UC-14 |
 | F-20 | wheelレジストリとタグ一致同期（Object Store） | workerごとの依存配布を一元化したい | UC-15 |
 | F-21 | wheel配布履歴（source/actor監査） | どこからアップロードされたか追跡したい | UC-15 |
+| F-22 | YAML bundle投入（複数workflow + submit情報） | 親子workflowを1枚の不変入力として扱いたい | UC-16 |
+| F-23 | spawn orchestration（同一bundle内 child run 起動） | workflow内から安全に別workflowを実行したい | UC-18 |
+| F-24 | approval付き orchestration run | spawnを含む実行を承認対象として止めたい | UC-17 |
+| F-25 | 親子run関係とbundle hash監査 | どのbundle由来で誰が何を起動したか追跡したい | UC-17, UC-18 |
 
 #6.ユースケース（Use Cases）
 | ID | 主体 | 目的 | 前提 | 主要手順（最小操作） | 成功条件 | 例外/制約 |
@@ -87,6 +93,9 @@
 | UC-13 | 運用者/GUI | worker表示を整理する | 対象workerが一覧に存在する | `PATCH /workers/{worker_id}` で `hidden` を切り替える | 運用上不要なworkerを非表示化/再表示できる | 対象workerが無ければ404 |
 | UC-14 | 運用者/利用者 | 実行中runを取消する | run_idを保持、HTTP Gateway/worker稼働 | `POST /runs/{run_id}/cancel` または `pyoco-client cancel --run-id <id>` を呼ぶ | runが `CANCELLING` を経て `CANCELLED` に収束する | 取消はbest-effort（legacy workerや境界外実行では即時停止を保証しない） |
 | UC-15 | 運用者/利用者 | wheelを配布し、対象workerだけ同期する | HTTP Gateway/worker稼働、Object Store利用可能 | `POST /wheels`（tags付き）で登録し、workerが定期同期する。`GET /wheels/history` で履歴を参照する | 同一パッケージはバージョンを必ず上げて登録され、workerタグと一致した最新版のみ同期・インストールされ、履歴で配布元を追跡できる | 同期/インストールはbest-effort（失敗時は再同期まで遅延） |
+| UC-16 | 利用者/研究者 | 1枚のYAML bundleを投入する | HTTP Gateway稼働、bundle schemaが妥当 | bundleを submit し、entry workflow を指定する | root run が生成され、bundle hash と entry workflow が記録される | bundle不正や禁止構造は受理しない |
+| UC-17 | 運用者/承認者 | spawnを含む bundle 実行を承認する | 対象bundleが `PENDING_APPROVAL` で記録済み | 承認対象bundleを確認し approve/reject を行う | approve で queue へ進み、reject で実行が停止する | 承認判定は entry workflow から到達可能な spawn に対してのみ必要 |
+| UC-18 | 利用者/研究者 | 親workflowから child workflow を起動し結果を集約する | root run が bundle 由来で実行中、child は同一bundle内 workflow のみ | parent run が spawn task を実行し、child run 完了と結果要約を待つ | child run が生成され、親が status / outputs / summary metrics / artifacts / error summary を参照できる | child run は再spawn不可、child 制約はサーバー設定で固定 |
 
 #7.Goals（Goalのみ／ユースケース紐づけ必須）
 - G-1: NATSを利用者に露出せず、HTTPのみでrun投入/参照できる（対応：UC-1, UC-2, UC-3, UC-4）
@@ -97,13 +106,15 @@
 - G-6: 実行中runを安全に取消できる（対応：UC-14）
 - G-7: worker依存の配布を中央管理し、タグ一致で安全に展開できる（対応：UC-15）
 - G-8: `nats-bootstrap` 連携で単体/クラスタ運用の手順を揃え、小チームでもDay-2運用を継続できる（対応：UC-12）
+- G-9: 1枚のbundleから親子workflowを安全に起動し、研究・開発用途の反復実行を支援できる（対応：UC-16, UC-18）
+- G-10: spawn を含む orchestration run を承認・監査でき、bundle 由来と親子関係を追跡できる（対応：UC-17, UC-18）
 
 #8.基本レイヤー構造（Layering）
 | レイヤー | 役割 | 主な処理/データ流れ |
 |---|---|---|
 | 運用UI層 | 運用者向けの最小GUI（read-only） | Dashboard→HTTP Gateway（一覧/詳細/SSE/workers/metrics） |
 | プレゼンテーション層 | HTTP I/FとクライアントI/F（CLI含む） | Client/CLI→HTTP Gateway、HTTP Gateway→JSON応答（KV由来） |
-| アプリケーション層 | ユースケースの編成 | run投入の原子性（KV+publish）、参照時の付加情報（worker状態判定/hidden制御）、wheel登録/配布制御 |
+| アプリケーション層 | ユースケースの編成 | run投入の原子性（KV+publish）、参照時の付加情報（worker状態判定/hidden制御）、wheel登録/配布制御、bundle静的解析、approval判定、spawn orchestration |
 | インフラ層 | JetStream資源と永続（最新状態） | WorkQueue publish/pull、KV put/get/keys（run/worker registry）、DLQ publish、Object Store（wheel registry） |
 | 実行層（worker） | Pyoco Engineでrunを実行 | flow解決→実行→traceでKVスナップショット更新→terminal化→ACK |
 
@@ -120,6 +131,10 @@
 | WheelHistoryEvent（配布履歴） | event_id, action, wheel_name, tags, occurred_at, source, actor | upload/delete監査（UC-15, F-21） |
 | WheelSyncState（worker同期状態） | worker_id, wheel_name, nuid, installed_at, sha256_hex | worker側の差分同期/再インストール判定（UC-15, F-20） |
 | DlqMessage（診断） | timestamp, reason, error, run_id?, flow_name?, tag?, tags?, worker_id?, num_delivered?, subject? | 診断（UC-6, F-6） |
+| WorkflowBundle | bundle_hash, schema_version, workflows, entry_workflow, inputs | bundle投入と不変性の基準（UC-16, F-22, F-25） |
+| RunRelation | run_id, root_run_id, parent_run_id, workflow_name, bundle_hash, spawned_from_task | 親子run追跡と監査（UC-17, UC-18, F-25） |
+| ApprovalRecord | run_id, bundle_hash, approval_required, approved_by?, approved_at?, rejected_at? | orchestration run の承認状態管理（UC-17, F-24） |
+| ChildRunResultSummary | run_id, status, outputs, summary_metrics, artifacts, error_summary | 親workflowが参照する child 結果要約（UC-18, F-23） |
 
 #10.機能部品の実装順序（Implementation Order）
 1. JetStreamリソース作成/確認（Stream/KV/DLQ）
@@ -138,6 +153,10 @@
 14. worker運用可視化（`RUNNING`/`IDLE`/`STOPPED_GRACEFUL`/`DISCONNECTED`）と表示制御（hide/unhide）
 15. run取消（`POST /runs/{run_id}/cancel`、worker協調停止、CLI `cancel`、E2E）
 16. wheelレジストリ（`/wheels`）とworker同期（タグ一致配布、差分インストール、E2E）
+17. YAML bundle schema と静的解析（entry workflow / spawn 到達判定 / bundle hash）
+18. approval 導線（`PENDING_APPROVAL`、approve/reject、監査）
+19. spawn orchestration（同一bundle内 child run 起動、child wait、result summary）
+20. 親子run relation / bundle監査 / E2E
 
 #11.用語集（Glossary）
 - run：Pyoco flow の1回の実行（分散の単位）。
@@ -162,3 +181,9 @@
 - wheel version policy：同一パッケージを再配布する場合は、必ずバージョンを上げる（同一/過去バージョンは拒否）。
 - wheel tags：wheelの適用対象を表すタグ集合。worker tags と1つ以上一致した場合に同期対象になる。
 - wheel history：wheelのupload/delete履歴。source（接続元情報）と actor（認証主体）を保持する監査データ。
+- bundle：複数workflowとsubmit情報を含む1枚のYAML文書。
+- entry workflow：bundle投入時に最初に起動する workflow。
+- spawn：workflow内 task が同一bundle内の別workflowを child run として起動する基盤概念。
+- root run：bundle投入で最初に生成される親 run。
+- child run：spawn により生成される run。再spawnはしない。
+- pending approval：spawn を含む bundle が queue 投入前に止まる承認待ち状態。

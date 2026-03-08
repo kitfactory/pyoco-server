@@ -29,8 +29,17 @@ from nats.js.errors import KeyNotFoundError, NotFoundError, ObjectNotFoundError
 from nats.errors import Error as NatsError
 
 from .auth import ApiKeyError, ApiKeyRecord, make_kv_key_for_api_key_id, parse_api_key, verify_api_key
+from .bundle_runtime import (
+    RUN_STATUS_PENDING_APPROVAL,
+    create_run_record,
+    load_workflow_bundle,
+    run_job_from_snapshot,
+    serialize_run_job,
+    store_workflow_bundle,
+)
 from .config import NatsBackendConfig
 from .logging_config import configure_logging
+from .models import RunJob
 from .models import (
     WORKER_ACTIVE_STATES,
     WORKER_STATES,
@@ -38,7 +47,12 @@ from .models import (
     normalize_worker_registry_record,
 )
 from .resources import ensure_resources
-from .workflow_yaml import WorkflowYamlValidationError, extract_flow_defaults, parse_workflow_yaml_bytes
+from .workflow_yaml import (
+    WorkflowYamlValidationError,
+    extract_flow_defaults,
+    parse_workflow_bundle_bytes,
+    parse_workflow_yaml_bytes,
+)
 
 _TERMINAL_RUN_STATUSES = {"COMPLETED", "FAILED", "CANCELLED"}
 _WHEEL_NAME_RE = re.compile(r"^[A-Za-z0-9._+-]+\.whl$")
@@ -223,6 +237,12 @@ class RunSubmitRequest(BaseModel):
 class RunSubmitResponse(BaseModel):
     run_id: str
     status: str
+    bundle_hash: Optional[str] = None
+
+
+class ApprovalDecisionRequest(BaseModel):
+    comment: Optional[str] = None
+    reason: Optional[str] = None
 
 
 class WorkerPatchRequest(BaseModel):
@@ -411,6 +431,11 @@ def create_app() -> FastAPI:
             json.dumps(evt, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
         )
 
+    def _approval_actor_id(auth: Optional[_AuthContext]) -> Optional[str]:
+        if auth is None:
+            return None
+        return f"api_key:{auth.api_key_id}"
+
     @app.on_event("startup")
     async def _startup() -> None:
         nc = await nats.connect(config.nats_url, name="pyoco-http-api")
@@ -419,6 +444,8 @@ def create_app() -> FastAPI:
         app.state.nc = nc
         app.state.js = js
         app.state.runs_kv = await js.key_value(config.runs_kv_bucket)
+        app.state.workflow_bundles_kv = await js.key_value(config.workflow_bundles_kv_bucket)
+        app.state.run_relations_kv = await js.key_value(config.run_relations_kv_bucket)
         app.state.workers_kv = await js.key_value(config.workers_kv_bucket)
         app.state.auth_kv = await js.key_value(config.auth_kv_bucket)
         app.state.wheel_store = await js.object_store(config.wheel_object_store_bucket)
@@ -1172,6 +1199,212 @@ def create_app() -> FastAPI:
 
         return RunSubmitResponse(run_id=run_id, status="PENDING")
 
+    @app.post("/runs/bundle", response_model=RunSubmitResponse)
+    async def submit_run_bundle(
+        request: Request,
+        bundle: UploadFile = File(...),
+        tag: Optional[str] = Form(default=None),
+    ) -> RunSubmitResponse:
+        js = app.state.js
+        runs_kv = app.state.runs_kv
+        bundle_kv = app.state.workflow_bundles_kv
+        relations_kv = app.state.run_relations_kv
+        cfg: NatsBackendConfig = app.state.config
+        auth = await _require_auth(request)
+
+        routing_tag = (tag or cfg.default_tag).strip()
+        if not routing_tag:
+            routing_tag = cfg.default_tag
+        if "." in routing_tag or not re.fullmatch(r"[A-Za-z0-9_-]+", routing_tag or ""):
+            raise HTTPException(status_code=422, detail="invalid tag")
+
+        raw = await bundle.read()
+        if len(raw) > int(cfg.workflow_bundle_max_bytes or 0):
+            raise HTTPException(status_code=413, detail="workflow bundle too large")
+
+        try:
+            parsed = parse_workflow_bundle_bytes(raw)
+        except WorkflowYamlValidationError:
+            raise HTTPException(status_code=422, detail="invalid workflow bundle")
+
+        approval_required = bool(cfg.spawn_requires_approval and parsed.approval_required)
+        run_id = str(uuid.uuid4())
+        now = time.time()
+        stored_tags = [routing_tag]
+        entry_workflow = parsed.submit.entry_workflow
+
+        job = RunJob(
+            run_id=run_id,
+            flow_name=entry_workflow,
+            tag=routing_tag,
+            tags=stored_tags,
+            params=dict(parsed.submit.inputs or {}),
+            submitted_at=now,
+            tenant_id=(auth.tenant_id if auth else None),
+            api_key_id=(auth.api_key_id if auth else None),
+            workflow_bundle=(raw.decode("utf-8") if not approval_required else None),
+            workflow_bundle_sha256=parsed.sha256,
+            workflow_bundle_bytes=parsed.size_bytes,
+            root_run_id=run_id,
+            parent_run_id=None,
+            spawned_from_task=None,
+            spawn_depth=0,
+            entry_workflow=entry_workflow,
+        )
+
+        try:
+            await store_workflow_bundle(bundle_kv, bundle_hash=parsed.sha256, raw=raw)
+            await create_run_record(
+                js=js,
+                runs_kv=runs_kv,
+                relations_kv=relations_kv,
+                config=cfg,
+                job=job,
+                status=(RUN_STATUS_PENDING_APPROVAL if approval_required else "PENDING"),
+                approval_required=approval_required,
+                approval_status=("pending" if approval_required else "not_required"),
+                approval_requested_at=(now if approval_required else None),
+                publish=(not approval_required),
+            )
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}")
+
+        return RunSubmitResponse(
+            run_id=run_id,
+            status=(RUN_STATUS_PENDING_APPROVAL if approval_required else "PENDING"),
+            bundle_hash=parsed.sha256,
+        )
+
+    @app.post("/runs/{run_id}/approve")
+    async def approve_run(
+        run_id: str,
+        request: Request,
+        body: ApprovalDecisionRequest,
+    ) -> Dict[str, Any]:
+        runs_kv = app.state.runs_kv
+        bundle_kv = app.state.workflow_bundles_kv
+        js = app.state.js
+        cfg: NatsBackendConfig = app.state.config
+        auth = await _require_auth(request)
+
+        try:
+            entry = await runs_kv.get(run_id)
+        except KeyNotFoundError:
+            raise HTTPException(status_code=404, detail="run not found")
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}")
+
+        snapshot = json.loads(entry.value.decode("utf-8"))
+        if auth is not None and snapshot.get("tenant_id") != auth.tenant_id:
+            raise HTTPException(status_code=404, detail="run not found")
+        if str(snapshot.get("status") or "").upper() != RUN_STATUS_PENDING_APPROVAL:
+            raise HTTPException(status_code=409, detail="run is not pending approval")
+        bundle_hash = str(snapshot.get("bundle_hash") or "").strip()
+        if not bundle_hash:
+            raise HTTPException(status_code=409, detail="bundle hash missing")
+
+        try:
+            bundle_text = await load_workflow_bundle(bundle_kv, bundle_hash=bundle_hash)
+        except KeyNotFoundError:
+            raise HTTPException(status_code=409, detail="workflow bundle not found")
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}")
+
+        now = time.time()
+        previous = dict(snapshot)
+        snapshot["status"] = "PENDING"
+        snapshot["approval_status"] = "approved"
+        snapshot["approved_at"] = now
+        snapshot["approved_by"] = _approval_actor_id(auth)
+        snapshot["approval_comment"] = body.comment
+        snapshot["updated_at"] = now
+
+        job = run_job_from_snapshot(snapshot, workflow_bundle=bundle_text)
+        job = RunJob(
+            run_id=job.run_id,
+            flow_name=job.flow_name,
+            tag=job.tag,
+            tags=job.tags,
+            params=job.params,
+            submitted_at=now,
+            tenant_id=job.tenant_id,
+            api_key_id=job.api_key_id,
+            workflow_yaml=job.workflow_yaml,
+            workflow_yaml_sha256=job.workflow_yaml_sha256,
+            workflow_yaml_bytes=job.workflow_yaml_bytes,
+            workflow_bundle=job.workflow_bundle,
+            workflow_bundle_sha256=job.workflow_bundle_sha256,
+            workflow_bundle_bytes=job.workflow_bundle_bytes,
+            root_run_id=job.root_run_id,
+            parent_run_id=job.parent_run_id,
+            spawned_from_task=job.spawned_from_task,
+            spawn_depth=job.spawn_depth,
+            entry_workflow=job.entry_workflow,
+        )
+
+        try:
+            await runs_kv.put(
+                run_id,
+                json.dumps(snapshot, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+            )
+            await js.publish(
+                subject=f"{cfg.work_subject_prefix}.{job.tag}",
+                payload=json.dumps(serialize_run_job(job), ensure_ascii=True, separators=(",", ":")).encode(
+                    "utf-8"
+                ),
+                stream=cfg.work_stream,
+            )
+        except NatsError as exc:
+            try:
+                await runs_kv.put(
+                    run_id,
+                    json.dumps(previous, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+                )
+            except Exception:
+                pass
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}")
+
+        return _filter_snapshot_for_http(snapshot, include=set(), mode="run")
+
+    @app.post("/runs/{run_id}/reject")
+    async def reject_run(
+        run_id: str,
+        request: Request,
+        body: ApprovalDecisionRequest,
+    ) -> Dict[str, Any]:
+        runs_kv = app.state.runs_kv
+        auth = await _require_auth(request)
+
+        try:
+            entry = await runs_kv.get(run_id)
+        except KeyNotFoundError:
+            raise HTTPException(status_code=404, detail="run not found")
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}")
+
+        snapshot = json.loads(entry.value.decode("utf-8"))
+        if auth is not None and snapshot.get("tenant_id") != auth.tenant_id:
+            raise HTTPException(status_code=404, detail="run not found")
+        if str(snapshot.get("status") or "").upper() != RUN_STATUS_PENDING_APPROVAL:
+            raise HTTPException(status_code=409, detail="run is not pending approval")
+
+        now = time.time()
+        snapshot["status"] = "CANCELLED"
+        snapshot["approval_status"] = "rejected"
+        snapshot["rejected_at"] = now
+        snapshot["rejected_by"] = _approval_actor_id(auth)
+        snapshot["rejection_reason"] = body.reason
+        snapshot["end_time"] = now
+        snapshot["updated_at"] = now
+        try:
+            await runs_kv.put(
+                run_id,
+                json.dumps(snapshot, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+            )
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}")
+        return _filter_snapshot_for_http(snapshot, include=set(), mode="run")
+
     @app.get("/runs/{run_id}")
     async def get_run(run_id: str, request: Request, include: list[str] = Query(default=[])) -> Dict[str, Any]:
         runs_kv = app.state.runs_kv
@@ -1254,10 +1487,14 @@ def create_app() -> FastAPI:
         status = str(snap.get("status") or "").upper()
         if status not in _TERMINAL_RUN_STATUSES:
             now = time.time()
-            snap["status"] = "CANCELLING"
-            snap["cancel_requested_at"] = float(snap.get("cancel_requested_at") or now)
-            if auth is not None:
-                snap["cancel_requested_by"] = f"api_key:{auth.api_key_id}"
+            if status == RUN_STATUS_PENDING_APPROVAL:
+                snap["status"] = "CANCELLED"
+                snap["end_time"] = now
+            else:
+                snap["status"] = "CANCELLING"
+                snap["cancel_requested_at"] = float(snap.get("cancel_requested_at") or now)
+                if auth is not None:
+                    snap["cancel_requested_by"] = f"api_key:{auth.api_key_id}"
             snap["updated_at"] = now
             try:
                 await runs_kv.put(

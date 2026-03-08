@@ -68,6 +68,22 @@ PYOCO_WHEEL_HISTORY_TTL_SEC="7776000" # 90 days
 # `POST /runs/yaml` で受け付ける `flow.yaml` のサイズ上限（bytes）。
 PYOCO_WORKFLOW_YAML_MAX_BYTES="262144"
 
+# Workflow Bundle / Spawn
+# `POST /runs/bundle` 相当で受け付ける bundle のサイズ上限。
+PYOCO_WORKFLOW_BUNDLE_MAX_BYTES="262144"
+# spawn を含む bundle を承認必須にするか（0|1）。
+PYOCO_SPAWN_REQUIRES_APPROVAL="1"
+# root run あたりの child run 総数上限。
+PYOCO_SPAWN_MAX_CHILD_RUNS="100"
+# root run あたりの child run 同時実行上限。
+PYOCO_SPAWN_MAX_PARALLEL_CHILD_RUNS="10"
+# 親が child の終端を監視するポーリング間隔（秒）。
+PYOCO_SPAWN_POLL_INTERVAL_SEC="1.0"
+# 親が child の結果要約取得を待つ上限（秒）。
+PYOCO_SPAWN_CHILD_WAIT_TIMEOUT_SEC="3600"
+# 親子 relation / approval 監査を保存する KV bucket。
+PYOCO_RUN_RELATIONS_KV_BUCKET="pyoco_run_relations"
+
 # Dashboard locale（UI文言）
 # auto: サーバーロケールから判定 / ja|en: 固定
 PYOCO_DASHBOARD_LANG="auto"
@@ -182,3 +198,18 @@ uv run pyoco-client --server http://127.0.0.1:8000 wheel-upload --wheel-file dis
 uv run pyoco-client --server http://127.0.0.1:8000 wheels
 uv run pyoco-client --server http://127.0.0.1:8000 wheel-history --limit 20
 ```
+
+## 9) Workflow Bundle / Spawn
+Workflow Bundle / Spawn は、single-flow の `POST /runs/yaml` とは別導線として扱います。
+
+- API：`POST /runs/bundle`, `POST /runs/{run_id}/approve`, `POST /runs/{run_id}/reject`
+- 状態：`PENDING_APPROVAL` / `PENDING` / `RUNNING` / `COMPLETED` / `FAILED` / `CANCELLED`
+- 制約：
+  - child run は同一 bundle 内 workflow のみを参照します。
+  - child run は再spawnしません。
+  - child run 数、並列数、wait timeout、approval 要否はサーバー設定で固定します。
+
+運用上の考え方：
+- 研究・開発用途で Study -> Trial のような反復実行を支援します。
+- 外部 registry / URL / 外部 YAML は参照しません。
+- root run / child run / bundle hash / spawned_from_task を監査対象として記録します。

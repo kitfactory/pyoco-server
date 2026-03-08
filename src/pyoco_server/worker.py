@@ -23,6 +23,11 @@ from packaging.version import Version
 from pyoco.core.engine import Engine
 from pyoco.core.models import Flow, RunContext, RunStatus
 
+from .bundle_runtime import (
+    SpawnOrchestrator,
+    build_child_run_result_summary,
+    build_flow_from_bundle_job,
+)
 from .config import NatsBackendConfig
 from .dlq import publish_dlq
 from .models import (
@@ -60,6 +65,7 @@ class PyocoNatsWorker:
         self._config = config
         self._js = nc.jetstream()
         self._kv = None
+        self._relations_kv = None
         self._workers_kv = None
         self._wheel_store = None
         self._subs = {}
@@ -117,6 +123,7 @@ class PyocoNatsWorker:
     async def _init(self) -> None:
         await ensure_resources(self._js, self._config)
         self._kv = await self._js.key_value(self._config.runs_kv_bucket)
+        self._relations_kv = await self._js.key_value(self._config.run_relations_kv_bucket)
         self._workers_kv = await self._js.key_value(self._config.workers_kv_bucket)
         self._wheel_store = await self._js.object_store(self._config.wheel_object_store_bucket)
         # Bind to per-tag durable consumers. Each consumer is shared among all workers
@@ -429,6 +436,13 @@ class PyocoNatsWorker:
         run_ctx = RunContext(run_id=job.run_id)
         run_ctx.flow_name = job.flow_name
         run_ctx.params = job.params or {}
+        existing_snapshot = None
+        try:
+            existing_entry = await self._kv.get(job.run_id)
+            existing_snapshot = json.loads(existing_entry.value.decode("utf-8"))
+        except Exception:
+            existing_snapshot = None
+        _copy_snapshot_metadata_to_run_ctx(run_ctx, existing_snapshot)
         run_ctx.metadata["tag"] = job.tag
         run_ctx.metadata["tags"] = list(job.tags or ([job.tag] if job.tag else []))
         if job.tenant_id:
@@ -439,6 +453,19 @@ class PyocoNatsWorker:
             run_ctx.metadata["workflow_yaml_sha256"] = job.workflow_yaml_sha256
         if job.workflow_yaml_bytes is not None:
             run_ctx.metadata["workflow_yaml_bytes"] = int(job.workflow_yaml_bytes)
+        if job.workflow_bundle_sha256:
+            run_ctx.metadata["bundle_hash"] = job.workflow_bundle_sha256
+        if job.workflow_bundle_bytes is not None:
+            run_ctx.metadata["workflow_bundle_bytes"] = int(job.workflow_bundle_bytes)
+        if job.root_run_id:
+            run_ctx.metadata["root_run_id"] = job.root_run_id
+        if job.parent_run_id:
+            run_ctx.metadata["parent_run_id"] = job.parent_run_id
+        if job.spawned_from_task:
+            run_ctx.metadata["spawned_from_task"] = job.spawned_from_task
+        run_ctx.metadata["spawn_depth"] = int(job.spawn_depth or 0)
+        if job.entry_workflow:
+            run_ctx.metadata["entry_workflow"] = job.entry_workflow
 
         started_at = time.time()
         try:
@@ -453,8 +480,18 @@ class PyocoNatsWorker:
             # Registry failure should not block task execution.
             pass
 
+        loop = asyncio.get_running_loop()
+        spawn_orchestrator = SpawnOrchestrator(
+            loop=loop,
+            js=self._js,
+            runs_kv=self._kv,
+            relations_kv=self._relations_kv,
+            config=self._config,
+            parent_job=job,
+        )
+
         try:
-            flow = _resolve_flow_for_job(job, self._flow_resolver)
+            flow = _resolve_flow_for_job(job, self._flow_resolver, spawn_orchestrator=spawn_orchestrator)
         except KeyError as exc:
             # Deterministic: the worker does not have the requested flow.
             logging.getLogger("pyoco_server.worker").exception(
@@ -511,11 +548,46 @@ class PyocoNatsWorker:
             except Exception:
                 pass
             return
+        except Exception as exc:
+            logging.getLogger("pyoco_server.worker").exception(
+                "invalid workflow for job",
+                extra={
+                    "err_id": "ERR-PYOCO-0007",
+                    "msg_id": "MSG-PYOCO-0007",
+                    "run_id": job.run_id,
+                    "flow_name": job.flow_name,
+                    "tag": job.tag,
+                    "worker_id": self._worker_id,
+                },
+            )
+            run_ctx.status = RunStatus.FAILED
+            err = str(exc)
+            await self._kv.put(
+                job.run_id,
+                json.dumps(
+                    run_snapshot_from_context(run_ctx, error=err),
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+            try:
+                await self._set_worker_registry(
+                    state=WORKER_STATE_IDLE,
+                    current_run_id=None,
+                    last_run_id=job.run_id,
+                    last_run_status="FAILED",
+                    last_run_finished_at=time.time(),
+                    stopped_at=None,
+                    stop_reason=None,
+                    touch=True,
+                )
+            except Exception:
+                pass
+            return
 
         # Use the resolved flow name as the canonical name (should match request).
         run_ctx.flow_name = flow.name
 
-        loop = asyncio.get_running_loop()
         backend = NatsKvTraceBackend(
             loop=loop,
             kv=self._kv,
@@ -600,13 +672,18 @@ class PyocoNatsWorker:
                 run_ctx.metadata["cancel_requested_by"] = cancel_state["requested_by"]
             # Ensure terminal snapshot after Engine returns/raises.
             terminal_status = str(getattr(run_ctx.status, "value", run_ctx.status))
+            terminal_snapshot = compact_run_snapshot(
+                run_snapshot_from_context(run_ctx, error=backend.get_error()),
+                max_bytes=int(getattr(self._config, "max_run_snapshot_bytes", 0) or 0),
+            )
+            if job.workflow_bundle_sha256:
+                summary = build_child_run_result_summary(terminal_snapshot)
+                run_ctx.metadata["result_summary"] = summary
+                terminal_snapshot["result_summary"] = summary
             await self._kv.put(
                 job.run_id,
                 json.dumps(
-                    compact_run_snapshot(
-                        run_snapshot_from_context(run_ctx, error=backend.get_error()),
-                        max_bytes=int(getattr(self._config, "max_run_snapshot_bytes", 0) or 0),
-                    ),
+                    terminal_snapshot,
                     ensure_ascii=True,
                     separators=(",", ":"),
                 ).encode("utf-8"),
@@ -1118,16 +1195,32 @@ def _decode_job(raw: bytes) -> RunJob:
         workflow_yaml=data.get("workflow_yaml"),
         workflow_yaml_sha256=data.get("workflow_yaml_sha256"),
         workflow_yaml_bytes=data.get("workflow_yaml_bytes"),
+        workflow_bundle=data.get("workflow_bundle"),
+        workflow_bundle_sha256=(data.get("workflow_bundle_sha256") or data.get("bundle_hash")),
+        workflow_bundle_bytes=data.get("workflow_bundle_bytes"),
+        root_run_id=data.get("root_run_id"),
+        parent_run_id=data.get("parent_run_id"),
+        spawned_from_task=data.get("spawned_from_task"),
+        spawn_depth=int(data.get("spawn_depth") or 0),
+        entry_workflow=data.get("entry_workflow"),
     )
 
 
-def _resolve_flow_for_job(job: RunJob, flow_resolver: Callable[[str], Flow]) -> Flow:
+def _resolve_flow_for_job(
+    job: RunJob,
+    flow_resolver: Callable[[str], Flow],
+    *,
+    spawn_orchestrator: Optional[SpawnOrchestrator] = None,
+) -> Flow:
     """
     Resolve a Flow for a job.
 
     - Normal path: flow_resolver(flow_name)
     - YAML path: build Flow from embedded flow.yaml (Phase 4)
     """
+
+    if job.workflow_bundle:
+        return build_flow_from_bundle_job(job, spawn_orchestrator=spawn_orchestrator)
 
     if not job.workflow_yaml:
         return flow_resolver(job.flow_name)
@@ -1157,3 +1250,31 @@ def _resolve_flow_for_job(job: RunJob, flow_resolver: Callable[[str], Flow]) -> 
     # Graph evaluation wires dependencies between tasks.
     exec(flow_conf.graph, {}, eval_context)
     return flow
+
+
+def _copy_snapshot_metadata_to_run_ctx(run_ctx: RunContext, snapshot: Any) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    for key in (
+        "bundle_hash",
+        "workflow_bundle_bytes",
+        "root_run_id",
+        "parent_run_id",
+        "spawned_from_task",
+        "spawn_depth",
+        "entry_workflow",
+        "approval_required",
+        "approval_status",
+        "approval_requested_at",
+        "approved_at",
+        "approved_by",
+        "approval_comment",
+        "rejected_at",
+        "rejected_by",
+        "rejection_reason",
+        "child_run_ids",
+        "spawn_count",
+        "result_summary",
+    ):
+        if key in snapshot and snapshot.get(key) is not None:
+            run_ctx.metadata[key] = snapshot.get(key)

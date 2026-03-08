@@ -23,6 +23,7 @@
   - run取消（`POST /runs/{run_id}/cancel`、`CANCELLING -> CANCELLED`、best-effort、`PYOCO_CANCEL_GRACE_PERIOD_SEC`）を実装し、HTTP/worker/CLI/Dashboard/E2E を反映済み
   - wheelレジストリ（JetStream Object Store）を追加し、`/wheels` API（list/upload/download/delete/history）と worker の wheel 同期・差分インストール（opt-in）を実装（wheelタグとworkerタグの一致で配布）
   - wheelアップロードは同一パッケージで「必ずバージョンアップ」を必須化（同一/過去バージョンは 409 で拒否）
+  - Spawn / YAML bundle を実装し、`POST /runs/bundle`、`POST /runs/{run_id}/approve`、`POST /runs/{run_id}/reject`、bundle hash / parent-child relation / child result summary / child 再spawn禁止を追加（review gate 待ち）
   - 文書方針を更新し、`pyoco-server` の位置づけを「軽量な分散実行バックエンド（社内システム向け最適化）」として明文化する
   - `nats-bootstrap` 連携の価値（対称運用 / Day-2運用）と現行制約（backup/restore・leave/controller・down）を README / docs 全体で整合させる
 - 非ゴール（やらないこと）:
@@ -34,6 +35,7 @@
   - spec: `./spec.md`
   - architecture: `./architecture.md`
   - plan: `./plan.md`
+  - spawn / bundle 要件定義: `./spawn_bundle_requirements.md`
   - quickstart: `./quickstart.md`
   - tutorial（server + 複数worker）: `./tutorial_multi_worker.md`
   - library api: `./library_api.md`

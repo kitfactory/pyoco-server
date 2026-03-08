@@ -20,6 +20,7 @@
   - run参照（KV読み出し）と任意のworker状態付加（worker registry）
   - GUI向けの最小状態管理I/F（一覧差分取得、run監視SSE）
   - （opt-in）HTTP API key 認証（`X-API-Key`）と tenant attribution（runへ帰属を刻む）
+  - YAML bundle parser、entry workflow 静的解析、approval 判定、bundle hash 記録、親子run relation 記録を担う
 - Dashboard UI（運用者向け、read-only）
   - run一覧/詳細、worker一覧、metrics を1画面で確認する
   - worker一覧は状態（`RUNNING`/`IDLE`/`STOPPED_GRACEFUL`/`DISCONNECTED`）と hidden 状態を表示する
@@ -40,6 +41,7 @@
   - cancel要求を検知した場合は `Engine.cancel(run_id)` を呼び、`CANCELLING -> CANCELLED` に収束させる（best-effort）
   - wheel同期（opt-in）：起動時と `run_once` の次回poll前に Object Store を同期し、タグ一致wheelのみ差分インストールする（実行中runの途中更新はしない）
   - 失敗分類に応じて ACK/NAK/TERM + DLQ publish（best-effort）
+  - spawn task 実行時に child run を起動し、child 完了待機と結果要約受け取りを行う
 - Admin CLI（運用：API key 管理）
   - API key の発行/一覧/失効を行い、JetStream KVへ保存する（平文キーは保存しない）
 - NATS JetStream
@@ -49,6 +51,7 @@
   - KV：pyoco_workers（worker registry）
   - KV：pyoco_auth（API key レコード）
   - KV：pyoco_wheel_history（wheel配布履歴）
+  - KV：pyoco_run_relations（将来の親子run relation / approval監査）
   - Object Store：pyoco_wheels（wheel registry）
 
 #2.concept のレイヤー構造との対応表
@@ -62,7 +65,7 @@
 | 運用UI層 | Dashboard UI | run/worker/metricsの継続監視 |
 | プレゼンテーション層（CLI） | pyoco-client / pyoco-server / pyoco-worker / pyoco-server-admin | 起動/投入/参照/運用操作のCLI導線 |
 | プレゼンテーション層 | PyocoHttpClient / 外部HTTPクライアント | HTTPでrun投入/参照 |
-| アプリケーション層 | HTTP Gateway（ユースケース実装） | 原子性・参照時の付加情報・worker状態判定/表示制御・wheel配布契約 |
+| アプリケーション層 | HTTP Gateway（ユースケース実装） | 原子性・参照時の付加情報・worker状態判定/表示制御・wheel配布契約・bundle静的解析・approval判定・relation記録 |
 | インフラ層 | JetStream（Stream/KV/DLQ/Object Store） | 分散キュー/最新状態/診断/配布アーティファクト |
 | 実行層（worker） | PyocoNatsWorker + Pyoco Engine | run実行と状態更新 |
 
@@ -73,6 +76,13 @@
 |---|---|---|---|---|
 | `POST /runs` | runを受理しKV初期化後にWorkQueueへ投入 | JSON（RunSubmitRequest）：flow_name: string(1+), params: object, tag?: string(`[A-Za-z0-9_-]+`、`.`禁止), tags?: array<string>（opt-in：HTTP auth有効時は header `X-API-Key` 必須） | JSON：run_id: uuid, status: "PENDING" | ERR-PYOCO-0002（422）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503）, ERR-PYOCO-0004（best-effort cleanup失敗の可能性） |
 | `POST /runs/yaml` | flow.yaml（YAML）を run として受理し、KV初期化後にWorkQueueへ投入 | multipart（RunSubmitYamlRequest）：workflow: file(YAML, bytes), flow_name: string(1+), tag?: string(`[A-Za-z0-9_-]+`、`.`禁止)（opt-in：HTTP auth有効時は header `X-API-Key` 必須。params上書きは提供しない） | JSON：run_id: uuid, status: "PENDING" | ERR-PYOCO-0002（422：YAML不正/不明キー/禁止キー/flow_name欠落等）, ERR-PYOCO-0016（413：サイズ上限超過）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503） |
+| `POST /runs/bundle` | 複数workflowを含む YAML bundle を受理し、entry workflow を root run として記録する | multipart：bundle:file(YAML), `submit.entry_workflow`, `submit.inputs` を含む bundle。spawn 到達時は approval 対象 | JSON：run_id: uuid, status: `PENDING` or `PENDING_APPROVAL`, bundle_hash | ERR-PYOCO-0025（422）, ERR-PYOCO-0016（413）, ERR-PYOCO-0003（503） |
+
+#### UC-17: spawn を含む bundle 実行を承認する
+| 操作/API | 役割 | 入力（型/主要フィールド/値範囲） | 出力（型/主要フィールド） | 例外（発生条件） |
+|---|---|---|---|---|
+| `POST /runs/{run_id}/approve` | `PENDING_APPROVAL` の root run を queue へ進める | path：run_id: uuid、body?: {comment?: string} | JSON：RunSnapshot（`status=PENDING`） | ERR-PYOCO-0026（404/409）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503） |
+| `POST /runs/{run_id}/reject` | 承認待ち root run を reject する | path：run_id: uuid、body?: {reason?: string} | JSON：RunSnapshot（`status=CANCELLED` 相当） | ERR-PYOCO-0026（404/409）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503） |
 
 #### UC-2: runの状態を確認する
 | 操作/API | 役割 | 入力（型/主要フィールド/値範囲） | 出力（型/主要フィールド） | 例外（発生条件） |
@@ -107,6 +117,12 @@
 | `POST /wheels` | wheelをタグ付きで登録する | multipart：wheel:file(`*.whl`), replace?:bool(default true), tags?:csv（`[A-Za-z0-9_-]+` のCSV）。同一パッケージは厳密なバージョンアップのみ許可（同一/過去バージョンは409）（opt-in：HTTP auth有効時は header `X-API-Key` 必須） | JSON：{name,size_bytes,bucket,nuid,modified,sha256_hex,tags} | ERR-PYOCO-0002（422/413）, ERR-PYOCO-0022（409）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503） |
 | `GET /wheels/{wheel_name}` | wheel bytes を取得する | path：wheel_name:string(`*.whl`)（opt-in：HTTP auth有効時は header `X-API-Key` 必須） | `application/octet-stream` | ERR-PYOCO-0023（404）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503） |
 | `DELETE /wheels/{wheel_name}` | wheelを削除する | path：wheel_name:string(`*.whl`)（opt-in：HTTP auth有効時は header `X-API-Key` 必須） | JSON：{name,deleted:true} | ERR-PYOCO-0023（404）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503） |
+
+#### UC-18: 親workflowから child workflow を起動し結果を集約する
+| 操作/API | 役割 | 入力（型/主要フィールド/値範囲） | 出力（型/主要フィールド） | 例外（発生条件） |
+|---|---|---|---|---|
+| `spawn` task | 同一bundle内 workflow を child run として起動する | task定義：`spawn: <workflow_name>`、実行文脈：root run の bundle_hash / current task 名 / server policy | ChildRunHandle（run_id, root_run_id, parent_run_id, workflow_name, bundle_hash, spawned_from_task） | ERR-PYOCO-0025（workflow不正）, ERR-PYOCO-0027（policy違反）, ERR-PYOCO-0030（child再spawn）, ERR-PYOCO-0003（503） |
+| child result summary fetch | parent が child の終端と要約を参照する | ChildRunHandle | ChildRunResultSummary（status, outputs, summary_metrics, artifacts, error_summary） | ERR-PYOCO-0029（timeout/参照範囲違反）, ERR-PYOCO-0003（503） |
 
 #### UC-11: ダッシュボードを表示する
 | 操作/API | 役割 | 入力（型/主要フィールド/値範囲） | 出力（型/主要フィールド） | 例外（発生条件） |
@@ -161,6 +177,7 @@
 | `kv.keys()` | KVキー一覧 | - | array<string> | NATS不可（ERR-PYOCO-0003） |
 | `kv.watch(key)` | KV更新監視 | key: string | async iterator | NATS不可（ERR-PYOCO-0003） |
 | `kv.delete(key)` | KV削除 | key: string | - | best-effort（ERR-PYOCO-0004） |
+| `kv.put(key, value)`（relation bucket） | 親子run関係/approval監査を保存 | key: relation key, value: bytes | rev | put失敗（ERR-PYOCO-0028） |
 | `js.object_store(bucket)` | Object Store取得 | bucket: string | object_store | bucketなし等（起動時にensure_resources） |
 | `object_store.put(name, data, meta)` | wheel登録 | name: string(`*.whl`), data: bytes, meta headers | info | put失敗（ERR-PYOCO-0003） |
 | `object_store.get(name)` | wheel取得 | name: string(`*.whl`) | object result(bytes) | not found（ERR-PYOCO-0023） |
@@ -371,6 +388,10 @@
 | RunListResponse | items: array<RunSummary or RunSnapshot>, next_cursor?: string | `GET /runs` |
 | RunWatchEvent | event: string(`snapshot`/`heartbeat`), run_id: uuid, snapshot: RunSnapshot, ts: number | `GET /runs/{run_id}/watch` |
 | RunCancelRequest | run_id: uuid, reason?: string | `POST /runs/{run_id}/cancel` |
+| RunSubmitBundleRequest | bundle: file or text(YAML), version: int, workflows: object, submit: object(`entry_workflow`, `inputs`) | `POST /runs/bundle` |
+| ApprovalDecision | run_id: uuid, action: enum(`approve|reject`), comment?: string, reason?: string | `POST /runs/{run_id}/approve` / `reject` |
+| RunRelationRecord | run_id: uuid, root_run_id: uuid, parent_run_id?: uuid, workflow_name: string, bundle_hash: string, spawned_from_task?: string, depth: int | 親子run relation / approval監査 |
+| ChildRunResultSummary | run_id: uuid, status: enum, outputs: object, summary_metrics: object, artifacts: array<object>, error_summary?: string | 親workflowが参照する child 結果 |
 | WheelArtifact | name: string(`*.whl`), size_bytes: int, bucket: string, nuid: string, modified: number, sha256_hex?: string/null, tags: array<string> | `GET/POST /wheels` |
 | WheelHistoryEvent | event_id: string, occurred_at: number, action: enum(`upload|delete`), wheel_name: string, tags: array<string>, source: object, actor: object | `GET /wheels/history` |
 | WheelSyncState | wheel_name: string, package_name: string, package_version: string, nuid: string, size_bytes: int, sha256_hex: string, tags: array<string>, installed_at: number | worker ローカル同期マニフェスト（`.installed.json`） |
@@ -399,6 +420,8 @@
 |---|---|---|---|
 | WorkQueueジョブ | JetStream Stream（PYOCO_WORK, WorkQueue） | runは1subjectにのみpublish（重複投入しない） | schema_version導入を将来検討（付録） |
 | run最新状態 | JetStream KV（pyoco_runs, history=1） | terminal化後にACK（at-least-once） | 追加フィールドは後方互換（未知フィールド無視） |
+| bundle監査情報 | JetStream KV（将来例：`pyoco_run_relations`） | `bundle_hash`、`entry_workflow`、approval状態、spawn回数を保持する | relation schemaは後方互換追加で拡張 |
+| 親子run relation | JetStream KV（将来例：`pyoco_run_relations`） | `run_id/root_run_id/parent_run_id/workflow_name/spawned_from_task` を保持する | key設計は run_id 主体で段階導入 |
 | worker registry | JetStream KV（pyoco_workers, history=1） | `last_seen_at` と disconnect timeout から `DISCONNECTED` を導出。`STOPPED_GRACEFUL` は保持する | 追加フィールドは後方互換で拡張 |
 | DLQ | JetStream Stream（PYOCO_DLQ, Limits） | 診断用。runの真実はKV | retention上限で運用 |
 | wheel registry | JetStream Object Store（pyoco_wheels） | wheelタグをmeta headerへ保持し、worker同期判定に利用する | header追加は後方互換で拡張 |
@@ -435,6 +458,11 @@
 | Wheel history KV bucket | env | `PYOCO_WHEEL_HISTORY_KV_BUCKET` | `pyoco_wheel_history` |
 | Wheel history TTL | env | `PYOCO_WHEEL_HISTORY_TTL_SEC` | `7776000`（90日） |
 | Workflow YAML size cap | env | `PYOCO_WORKFLOW_YAML_MAX_BYTES` | `262144` |
+| Bundle YAML size cap（将来） | env | `PYOCO_WORKFLOW_BUNDLE_MAX_BYTES` | `262144` |
+| Spawn max child runs（将来） | env | `PYOCO_SPAWN_MAX_CHILD_RUNS` | `100` |
+| Spawn max parallel child runs（将来） | env | `PYOCO_SPAWN_MAX_PARALLEL_CHILD_RUNS` | `10` |
+| Spawn poll interval（将来） | env | `PYOCO_SPAWN_POLL_INTERVAL_SEC` | `1.0` |
+| Approval required for spawn bundle（将来） | env | `PYOCO_SPAWN_REQUIRES_APPROVAL` | `1` |
 | Dashboard locale | env | `PYOCO_DASHBOARD_LANG` | `auto`（`auto|ja|en`） |
 | Dotenv auto load | env | `PYOCO_LOAD_DOTENV` | `1`（`0|1`） |
 | Dotenv file path | env | `PYOCO_ENV_FILE` | `.env` |
@@ -451,6 +479,8 @@
 | wheel registry I/F | 依存配布契約 | 署名検証/承認フロー/配布チャネル分離（将来） |
 | run watch stream | GUIの詳細監視 | server push最適化（初期はSSE、将来はWS併用） |
 | Snapshot schema | 可視化 | event stream（履歴/ログ）導入でKV肥大化を回避（将来） |
+| Bundle submit I/F | orchestration run 入力 | `/runs/bundle` を採用する |
+| Spawn orchestration | 親子workflow実行 | worker内実装と coordinator 分離のどちらにも拡張余地を残す |
 
 #7.5.依存関係（DI）
 （テキスト図示）
@@ -460,8 +490,10 @@ PyocoNatsWorker -> NatsBackendConfig -> NATS JetStream
 PyocoNatsWorker -> flow_resolver -> Pyoco Flow（通常の `POST /runs` 経路）
 PyocoNatsWorker -> workflow_yaml（flow.yaml） -> Pyoco Flow（`POST /runs/yaml` 経路）
 HTTP Gateway -> runs KV -> cancel flag（`POST /runs/{run_id}/cancel` 経路）
+HTTP Gateway -> bundle parser -> approval analyzer -> runs KV / relation KV（将来の bundle 経路）
 HTTP Gateway -> wheel Object Store（`/wheels*`）
 PyocoNatsWorker -> wheel Object Store -> local wheel dir -> pip install（同期経路）
+PyocoNatsWorker -> spawn orchestrator -> runs KV / relation KV / child wait（将来の orchestration 経路）
 Pyoco Engine -> TraceBackend(NatsKvTraceBackend) -> JetStream KV
 ```
 
@@ -469,6 +501,7 @@ Pyoco Engine -> TraceBackend(NatsKvTraceBackend) -> JetStream KV
 |---|---|---|
 | HTTP Gateway | NatsBackendConfig（envから生成） | 資源名/既定の集約 |
 | PyocoNatsWorker | NatsBackendConfig, flow_resolver | 実行と状態更新 |
+| SpawnOrchestrator（将来） | NatsBackendConfig, runs KV, relation KV, publish client | child run 起動、待機、結果要約取得 |
 | NatsKvTraceBackend | asyncio loop, KV, RunContext | thread-safeにKVへflush |
 | Client CLI | PyocoHttpClient | run操作のCLI I/F |
 
@@ -484,6 +517,12 @@ Pyoco Engine -> TraceBackend(NatsKvTraceBackend) -> JetStream KV
 | wheel不存在 | HTTP Gateway | `GET/DELETE /wheels/{wheel_name}` の対象が無い | 404で返す | ERR-PYOCO-0023 |
 | cancel収束タイムアウト | Worker | cancel要求後も `CANCELLED` へ遷移しない | `ERR-PYOCO-0021` を記録し、運用で再判断する | best-effort |
 | wheel同期失敗 | Worker | Object Store取得失敗、pip install失敗、ローカルI/O失敗 | ログ記録して次回同期で再試行 | ERR-PYOCO-0024（best-effort） |
+| bundle入力不正 | HTTP Gateway | workflow重複、entry workflow 不在、bundle外参照、schema不正 | 422で返す | ERR-PYOCO-0025 |
+| approval状態不正 | HTTP Gateway | approve/reject 対象不存在、状態不整合、終端後操作 | 404/409で返す | ERR-PYOCO-0026 |
+| spawn policy違反 | Worker / Orchestrator | child数、並列数、tag、timeout等が制約外 | child起動を拒否し監査する | ERR-PYOCO-0027 |
+| relation保存失敗 | HTTP Gateway / Worker | 親子relationやbundle監査を永続化できない | 失敗として停止し再試行可能にする | ERR-PYOCO-0028 |
+| child wait timeout | Worker / Orchestrator | child終端待機が上限超過 | 親へ失敗を返し監査する | ERR-PYOCO-0029 |
+| child再spawn | Worker / Orchestrator | child run 内で spawn が評価された | 拒否して監査する | ERR-PYOCO-0030 |
 | NATS不可（HTTP） | HTTP Gateway | connect/KV/publish失敗 | 503で返す | ERR-PYOCO-0003 |
 | run_id不存在 | HTTP Gateway | KV not found | 404で返す | ERR-PYOCO-0005 |
 | 不正ジョブ | Worker | JSON不正/必須欠落 | DLQ+TERM（再配送しない） | reason=invalid_job |

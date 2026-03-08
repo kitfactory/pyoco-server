@@ -52,6 +52,36 @@ class PyocoHttpClient:
         resp.raise_for_status()
         return resp.json()
 
+    def submit_bundle_yaml(
+        self,
+        bundle_yaml: str,
+        *,
+        tag: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        files = {"bundle": ("bundle.yaml", bundle_yaml.encode("utf-8"), "application/x-yaml")}
+        data: Dict[str, Any] = {}
+        if tag is not None:
+            data["tag"] = tag
+        resp = self._client.post("/runs/bundle", files=files, data=data)
+        resp.raise_for_status()
+        return resp.json()
+
+    def approve_run(self, run_id: str, *, comment: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if comment is not None:
+            payload["comment"] = comment
+        resp = self._client.post(f"/runs/{run_id}/approve", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
+    def reject_run(self, run_id: str, *, reason: Optional[str] = None) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {}
+        if reason is not None:
+            payload["reason"] = reason
+        resp = self._client.post(f"/runs/{run_id}/reject", json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
     def get_run(self, run_id: str) -> Dict[str, Any]:
         resp = self._client.get(f"/runs/{run_id}")
         resp.raise_for_status()

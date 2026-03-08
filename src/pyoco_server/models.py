@@ -70,12 +70,31 @@ def run_snapshot_from_context(run_ctx: RunContext, *, error: Optional[str] = Non
         "api_key_id": meta.get("api_key_id"),
         "workflow_yaml_sha256": meta.get("workflow_yaml_sha256"),
         "workflow_yaml_bytes": meta.get("workflow_yaml_bytes"),
+        "bundle_hash": meta.get("bundle_hash"),
+        "workflow_bundle_bytes": meta.get("workflow_bundle_bytes"),
+        "root_run_id": meta.get("root_run_id"),
+        "parent_run_id": meta.get("parent_run_id"),
+        "spawned_from_task": meta.get("spawned_from_task"),
+        "spawn_depth": meta.get("spawn_depth"),
+        "entry_workflow": meta.get("entry_workflow"),
+        "approval_required": meta.get("approval_required"),
+        "approval_status": meta.get("approval_status"),
+        "approval_requested_at": meta.get("approval_requested_at"),
+        "approved_at": meta.get("approved_at"),
+        "approved_by": meta.get("approved_by"),
+        "approval_comment": meta.get("approval_comment"),
+        "rejected_at": meta.get("rejected_at"),
+        "rejected_by": meta.get("rejected_by"),
+        "rejection_reason": meta.get("rejection_reason"),
         "cancel_requested_at": meta.get("cancel_requested_at"),
         "cancel_requested_by": meta.get("cancel_requested_by"),
         "status": _enum_value(run_ctx.status),
         "params": run_ctx.params or {},
         "tasks": {k: _enum_value(v) for k, v in (run_ctx.tasks or {}).items()},
         "task_records": run_ctx.serialize_task_records() if hasattr(run_ctx, "serialize_task_records") else {},
+        "child_run_ids": list(meta.get("child_run_ids") or []),
+        "spawn_count": int(meta.get("spawn_count") or 0),
+        "result_summary": meta.get("result_summary"),
         "start_time": getattr(run_ctx, "start_time", None),
         "end_time": getattr(run_ctx, "end_time", None),
         "heartbeat_at": now,
@@ -179,3 +198,11 @@ class RunJob:
     workflow_yaml: Optional[str] = None
     workflow_yaml_sha256: Optional[str] = None
     workflow_yaml_bytes: Optional[int] = None
+    workflow_bundle: Optional[str] = None
+    workflow_bundle_sha256: Optional[str] = None
+    workflow_bundle_bytes: Optional[int] = None
+    root_run_id: Optional[str] = None
+    parent_run_id: Optional[str] = None
+    spawned_from_task: Optional[str] = None
+    spawn_depth: int = 0
+    entry_workflow: Optional[str] = None

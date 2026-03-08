@@ -1,6 +1,11 @@
 # plan.md（必ず書く：最新版）
 
 # current
+- [x] delta運用の修正：1要件を1本の delta で request/apply/verify/archive まで進める前提に見直し、spawn / bundle の細分化した delta を `DR-20260308-spawn-bundle` に統合する（`docs/plan.md` / `docs/delta/DR-20260308-spawn-bundle`）
+- [x] Delta Request：`DR-20260308-spawn-bundle` を Spawn / YAML Bundle 要件の canonical delta として再定義し、docs・設計・実装・テストまでを In Scope に含める
+- [x] Delta Apply：`DR-20260308-spawn-bundle` の範囲で bundle submit / approval API、bundle parser、relation保存、worker spawn orchestration、設定、テストを実装する
+- [x] Delta Verify：`DR-20260308-spawn-bundle` の AC に対して static / targeted unit / targeted integration or E2E / review gate を確認する
+- [x] Delta Archive：`DR-20260308-spawn-bundle` を archive し、未解決事項として巨大ファイル是正と全量テスト未実施を記録する
 - [x] 追加要望対応：wheelアップロード時に複数タグを保持し、workerタグ一致時のみ同期する仕様を反映する（`src/pyoco_server/http_api.py` / `src/pyoco_server/worker.py` / `src/pyoco_server/client_cli.py`）
 - [x] 現状確認：workerの依存配布運用を調査し、wheelレジストリ（server管理 + worker同期）の実装方針を確定する（`src/pyoco_server/http_api.py` / `src/pyoco_server/worker.py` / `src/pyoco_server/resources.py`）
 - [x] 実装1（リソース/設定）：JetStream Object Store を wheel レジストリとして追加し、env/CLI設定を拡張する（`src/pyoco_server/config.py` / `src/pyoco_server/resources.py` / `src/pyoco_server/worker_cli.py`）
@@ -29,6 +34,11 @@
 
 # future
 （現状スナップショット：実装/テスト/デモの所在 は `docs/OVERVIEW.md` に移動）
+
+- delta運用の定着
+  - 大きい変更は delta-request を先に作成し、request/apply/verify/archive を `docs/delta/*.md` で履歴化する
+  - `review gate required: Yes` の delta では `docs/delta/REVIEW_CHECKLIST.md` と validator を通す
+  - concept/spec/architecture/plan の同期は delta archive 完了後に次 delta へ進む
 
 - Phase 4（将来）：運用I/Fの追加改善
   - runs一覧の追加改善（必要なら）

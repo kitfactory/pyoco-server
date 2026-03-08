@@ -58,6 +58,18 @@ async def ensure_resources(js, config: NatsBackendConfig) -> None:
             )
         )
 
+    # KV bucket (workflow bundle raw YAML by hash)
+    try:
+        await js.key_value(config.workflow_bundles_kv_bucket)
+    except NotFoundError:
+        await js.create_key_value(api.KeyValueConfig(bucket=config.workflow_bundles_kv_bucket, history=1))
+
+    # KV bucket (bundle run relation / audit trail)
+    try:
+        await js.key_value(config.run_relations_kv_bucket)
+    except NotFoundError:
+        await js.create_key_value(api.KeyValueConfig(bucket=config.run_relations_kv_bucket, history=1))
+
     # KV bucket (auth; API keys)
     # Kept separate from runs/workers so it can be access-controlled independently.
     # 認証用KV（API key）。runs/workersと分離して権限分離しやすくする。

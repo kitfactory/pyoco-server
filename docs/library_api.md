@@ -139,6 +139,8 @@ API：
 API：
 - `client.submit_run(flow_name, params, tag=..., tags=...) -> dict`
 - `client.submit_run_yaml(workflow_yaml, flow_name=..., tag=...) -> dict`
+- `client.submit_bundle_yaml(bundle_yaml) -> dict`
+  - 複数workflowと `submit.entry_workflow` を含む bundle を投入します。
 - `client.get_run(run_id) -> dict`
 - `client.get_run_with_records(run_id) -> dict`（`include=records`）
 - `client.get_tasks(run_id) -> dict`
@@ -148,6 +150,8 @@ API：
 - `client.watch_run(run_id, include_records=False, since=..., timeout_sec=...) -> generator`
   - SSE（`/runs/{run_id}/watch`）を購読し、`{"event": ..., "data": ...}` を順次返します。
 - `client.cancel_run(run_id, wait=False, timeout_sec=...) -> dict`
+- `client.approve_run(run_id, comment=...) -> dict`
+- `client.reject_run(run_id, reason=...) -> dict`
 - `client.get_workers(scope=..., state=..., include_hidden=..., limit=...) -> list[dict]`
   - worker運用一覧（`GET /workers`）を取得します。
   - 既定は `scope=active` / `include_hidden=false` です（HTTP側の既定）。
@@ -173,6 +177,7 @@ API：
 - gateway は運用向けDashboard UIを静的配信します（`GET /` / `GET /static/*`）。
 - gateway は wheel registry API（`GET/POST /wheels`, `GET/DELETE /wheels/{wheel_name}`）を提供します。
 - gateway は wheel配布履歴 API（`GET /wheels/history`）を提供します。
+- gateway は bundle submit / approval API（`POST /runs/bundle`, `POST /runs/{run_id}/approve`, `POST /runs/{run_id}/reject`）を提供します。
 
 ログ：
 - HTTP Gateway / worker（呼び出し側）は `PYOCO_LOG_*` の設定を読み取り、stdoutへログを出力できます。
