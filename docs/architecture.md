@@ -17,6 +17,8 @@
   - HTTP APIを提供（run投入/参照/取消、worker運用可視化/表示制御、wheel管理）
   - JetStreamリソースの確認/作成（Stream/KV/DLQ/Object Store）
   - run投入の原子性（KV初期化 + publish 成功でのみ成功応答）
+  - YAML schedule 定義（one-shot / interval）を KV に保持し、due 時刻で既存 YAML run 契約へ変換して投入する
+  - schedule 由来 run に `schedule_id` を刻み、schedule 単位で run 一覧を返す
   - run参照（KV読み出し）と任意のworker状態付加（worker registry）
   - GUI向けの最小状態管理I/F（一覧差分取得、run監視SSE）
   - （opt-in）HTTP API key 認証（`X-API-Key`）と tenant attribution（runへ帰属を刻む）
@@ -48,6 +50,7 @@
   - Stream：PYOCO_WORK（WorkQueue）
   - Stream：PYOCO_DLQ（診断用）
   - KV：pyoco_runs（最新スナップショット）
+  - KV：pyoco_yaml_schedules（YAML schedule 定義）
   - KV：pyoco_workers（worker registry）
   - KV：pyoco_auth（API key レコード）
   - KV：pyoco_wheel_history（wheel配布履歴）
@@ -76,6 +79,7 @@
 |---|---|---|---|---|
 | `POST /runs` | runを受理しKV初期化後にWorkQueueへ投入 | JSON（RunSubmitRequest）：flow_name: string(1+), params: object, tag?: string(`[A-Za-z0-9_-]+`、`.`禁止), tags?: array<string>（opt-in：HTTP auth有効時は header `X-API-Key` 必須） | JSON：run_id: uuid, status: "PENDING" | ERR-PYOCO-0002（422）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503）, ERR-PYOCO-0004（best-effort cleanup失敗の可能性） |
 | `POST /runs/yaml` | flow.yaml（YAML）を run として受理し、KV初期化後にWorkQueueへ投入 | multipart（RunSubmitYamlRequest）：workflow: file(YAML, bytes), flow_name: string(1+), tag?: string(`[A-Za-z0-9_-]+`、`.`禁止)（opt-in：HTTP auth有効時は header `X-API-Key` 必須。params上書きは提供しない） | JSON：run_id: uuid, status: "PENDING" | ERR-PYOCO-0002（422：YAML不正/不明キー/禁止キー/flow_name欠落等）, ERR-PYOCO-0016（413：サイズ上限超過）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503） |
+| `POST /schedules/yaml` / `GET /schedules` / `DELETE /schedules/{schedule_id}` / `GET /schedules/{schedule_id}/runs` | YAML schedule を作成・参照・削除し、schedule 由来 run 一覧を取得する | multipart / path / auth header。`run_at` または `interval_seconds` を指定し、`start_at` は interval のみ任意 | JSON：schedule_id, status, schedule_type, next_run_at, run list 等 | ERR-PYOCO-0002（422）, ERR-PYOCO-0016（413）, ERR-PYOCO-0031（404）, ERR-PYOCO-0014（401）, ERR-PYOCO-0015（403）, ERR-PYOCO-0003（503） |
 | `POST /runs/bundle` | 複数workflowを含む YAML bundle を受理し、entry workflow を root run として記録する | multipart：bundle:file(YAML), `submit.entry_workflow`, `submit.inputs` を含む bundle。spawn 到達時は approval 対象 | JSON：run_id: uuid, status: `PENDING` or `PENDING_APPROVAL`, bundle_hash | ERR-PYOCO-0025（422）, ERR-PYOCO-0016（413）, ERR-PYOCO-0003（503） |
 
 #### UC-17: spawn を含む bundle 実行を承認する
@@ -173,6 +177,7 @@
 | `js.publish(subject, payload, stream=...)` | WorkQueue/DLQへpublish | subject: string, payload: bytes | ack | publish失敗（ERR-PYOCO-0003） |
 | `js.key_value(bucket)` | KV取得 | bucket: string | kv | bucketなし等（起動時にensure_resources） |
 | `kv.put(key, value)` | KV更新 | key: string, value: bytes | rev | put失敗（ERR-PYOCO-0003/0008） |
+| `kv.update(key, value, last=revision)` | schedule claim / dispatch後更新 | key: string, value: bytes, revision: int | rev | revision競合 / NATS不可（ERR-PYOCO-0003） |
 | `kv.get(key)` | KV取得 | key: string | entry | not found（ERR-PYOCO-0005） |
 | `kv.keys()` | KVキー一覧 | - | array<string> | NATS不可（ERR-PYOCO-0003） |
 | `kv.watch(key)` | KV更新監視 | key: string | async iterator | NATS不可（ERR-PYOCO-0003） |

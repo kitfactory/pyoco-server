@@ -137,6 +137,118 @@ def test_server_cli_with_nats_bootstrap_starts_and_stops_child(monkeypatch: pyte
     assert called["args"] == ("pyoco_server.http_api:create_app",)
 
 
+def test_server_cli_with_worker_starts_and_stops_child(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_worker_proc = _FakeProc()
+    popen_calls: list[list[str]] = []
+    called: dict[str, Any] = {}
+
+    def _fake_popen(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        popen_calls.append([str(x) for x in cmd])
+        return fake_worker_proc
+
+    def _fake_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        called["args"] = args
+        called["kwargs"] = kwargs
+
+    monkeypatch.setattr(server_cli.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(server_cli.uvicorn, "run", _fake_run)
+    monkeypatch.delenv("PYOCO_NATS_URL", raising=False)
+
+    rc = server_cli.main(
+        [
+            "up",
+            "--nats-url",
+            "nats://example:4222",
+            "--with-worker",
+            "--worker-id",
+            "w1",
+            "--worker-tags",
+            "cpu,gpu",
+            "--worker-flow-resolver",
+            "examples/hello_flow.py:resolve_flow",
+            "--worker-poll-timeout",
+            "2.5",
+        ]
+    )
+
+    assert rc == 0
+    assert fake_worker_proc.terminated is True
+    assert popen_calls == [
+        [
+            server_cli.sys.executable,
+            "-m",
+            "pyoco_server.worker_cli",
+            "--worker-id",
+            "w1",
+            "--tags",
+            "cpu,gpu",
+            "--nats-url",
+            "nats://example:4222",
+            "--flow-resolver",
+            "examples/hello_flow.py:resolve_flow",
+            "--poll-timeout",
+            "2.5",
+        ]
+    ]
+    assert called["args"] == ("pyoco_server.http_api:create_app",)
+
+
+def test_server_cli_with_nats_bootstrap_and_worker_starts_both_children(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_nats_proc = _FakeProc()
+    fake_worker_proc = _FakeProc()
+    popen_calls: list[list[str]] = []
+    port_checks = iter([False, False, True])
+
+    def _fake_popen(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        rendered = [str(x) for x in cmd]
+        popen_calls.append(rendered)
+        if rendered[0] == "/bin/nats-bootstrap":
+            return fake_nats_proc
+        return fake_worker_proc
+
+    def _fake_port_is_open(host: str, port: int, timeout_sec: float = 0.2) -> bool:
+        del host, port, timeout_sec
+        return next(port_checks)
+
+    monkeypatch.setattr(server_cli, "_find_nats_bootstrap", lambda: "/bin/nats-bootstrap")
+    monkeypatch.setattr(server_cli.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(server_cli, "_port_is_open", _fake_port_is_open)
+    monkeypatch.setattr(server_cli.uvicorn, "run", lambda *args, **kwargs: None)
+    monkeypatch.delenv("PYOCO_NATS_URL", raising=False)
+
+    rc = server_cli.main(
+        [
+            "up",
+            "--with-nats-bootstrap",
+            "--with-worker",
+            "--worker-id",
+            "w-boot",
+            "--worker-tags",
+            "default",
+        ]
+    )
+
+    assert rc == 0
+    assert fake_worker_proc.terminated is True
+    assert fake_nats_proc.terminated is True
+    assert popen_calls == [
+        ["/bin/nats-bootstrap", "up", "--", "-js", "-a", "127.0.0.1", "-p", "4222", "-m", "8222"],
+        [
+            server_cli.sys.executable,
+            "-m",
+            "pyoco_server.worker_cli",
+            "--worker-id",
+            "w-boot",
+            "--tags",
+            "default",
+            "--nats-url",
+            "nats://127.0.0.1:4222",
+        ],
+    ]
+
+
 def test_server_cli_with_nats_bootstrap_port_conflict(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server_cli, "_find_nats_bootstrap", lambda: "/bin/nats-bootstrap")
     monkeypatch.setattr(server_cli, "_port_is_open", lambda host, port, timeout_sec=0.2: True)
@@ -183,6 +295,26 @@ def test_server_cli_stops_child_even_when_uvicorn_raises(monkeypatch: pytest.Mon
         server_cli.main(["up", "--with-nats-bootstrap"])
 
     assert fake_proc.terminated is True
+
+
+def test_server_cli_stops_worker_even_when_uvicorn_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_worker_proc = _FakeProc()
+
+    def _fake_popen(cmd, *args, **kwargs):  # type: ignore[no-untyped-def]
+        del cmd, args, kwargs
+        return fake_worker_proc
+
+    def _fake_uvicorn_run(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(server_cli.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(server_cli.uvicorn, "run", _fake_uvicorn_run)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        server_cli.main(["up", "--nats-url", "nats://example:4222", "--with-worker"])
+
+    assert fake_worker_proc.terminated is True
 
 
 def test_server_cli_kills_child_when_terminate_times_out(monkeypatch: pytest.MonkeyPatch) -> None:

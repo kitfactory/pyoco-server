@@ -88,6 +88,7 @@ class NatsBackendConfig:
     runs_kv_bucket: str = "pyoco_runs"
     workflow_bundles_kv_bucket: str = "pyoco_workflow_bundles"
     run_relations_kv_bucket: str = "pyoco_run_relations"
+    yaml_schedules_kv_bucket: str = "pyoco_yaml_schedules"
 
     # Worker liveness (JetStream KV with TTL)
     workers_kv_bucket: str = "pyoco_workers"
@@ -147,6 +148,7 @@ class NatsBackendConfig:
     # flow.yaml は JetStream の1メッセージとして投入するため、サイズ上限を設ける。
     # Since flow.yaml is carried inside a single JetStream message, keep it bounded.
     workflow_yaml_max_bytes: int = 256 * 1024  # 256 KiB
+    schedule_poll_interval_sec: float = 1.0
     workflow_bundle_max_bytes: int = 256 * 1024  # 256 KiB
     spawn_requires_approval: bool = True
     spawn_max_child_runs: int = 100
@@ -222,6 +224,10 @@ class NatsBackendConfig:
                 "PYOCO_RUN_RELATIONS_KV_BUCKET", cls.run_relations_kv_bucket
             )
             or cls.run_relations_kv_bucket,
+            yaml_schedules_kv_bucket=_env_raw(
+                "PYOCO_YAML_SCHEDULES_KV_BUCKET", cls.yaml_schedules_kv_bucket
+            )
+            or cls.yaml_schedules_kv_bucket,
             workers_kv_bucket=_env_raw("PYOCO_WORKERS_KV_BUCKET", cls.workers_kv_bucket)
             or cls.workers_kv_bucket,
             work_subject_prefix=_env_raw("PYOCO_WORK_SUBJECT_PREFIX", cls.work_subject_prefix)
@@ -283,6 +289,9 @@ class NatsBackendConfig:
             ),
             workflow_yaml_max_bytes=_env_int(
                 "PYOCO_WORKFLOW_YAML_MAX_BYTES", cls.workflow_yaml_max_bytes
+            ),
+            schedule_poll_interval_sec=_env_float(
+                "PYOCO_SCHEDULE_POLL_INTERVAL_SEC", cls.schedule_poll_interval_sec
             ),
             workflow_bundle_max_bytes=_env_int(
                 "PYOCO_WORKFLOW_BUNDLE_MAX_BYTES", cls.workflow_bundle_max_bytes

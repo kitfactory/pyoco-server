@@ -66,6 +66,54 @@ class PyocoHttpClient:
         resp.raise_for_status()
         return resp.json()
 
+    def create_yaml_schedule(
+        self,
+        workflow_yaml: str,
+        *,
+        flow_name: str,
+        tag: str,
+        run_at: Optional[str] = None,
+        interval_seconds: Optional[float] = None,
+        start_at: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        files = {"workflow": ("flow.yaml", workflow_yaml.encode("utf-8"), "application/x-yaml")}
+        data: Dict[str, Any] = {"flow_name": flow_name, "tag": tag}
+        if run_at is not None:
+            data["run_at"] = run_at
+        if interval_seconds is not None:
+            data["interval_seconds"] = str(interval_seconds)
+        if start_at is not None:
+            data["start_at"] = start_at
+        resp = self._client.post("/schedules/yaml", files=files, data=data)
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_schedules(self) -> list[Dict[str, Any]]:
+        resp = self._client.get("/schedules")
+        resp.raise_for_status()
+        return resp.json()
+
+    def list_schedule_runs(
+        self,
+        schedule_id: str,
+        *,
+        include_records: bool = False,
+        limit: Optional[int] = None,
+    ) -> list[Dict[str, Any]]:
+        params: Dict[str, Any] = {}
+        if include_records:
+            params["include"] = "records"
+        if limit is not None:
+            params["limit"] = int(limit)
+        resp = self._client.get(f"/schedules/{schedule_id}/runs", params=params)
+        resp.raise_for_status()
+        return resp.json()
+
+    def delete_schedule(self, schedule_id: str) -> Dict[str, Any]:
+        resp = self._client.delete(f"/schedules/{schedule_id}")
+        resp.raise_for_status()
+        return resp.json()
+
     def approve_run(self, run_id: str, *, comment: Optional[str] = None) -> Dict[str, Any]:
         payload: Dict[str, Any] = {}
         if comment is not None:

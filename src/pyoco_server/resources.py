@@ -64,6 +64,12 @@ async def ensure_resources(js, config: NatsBackendConfig) -> None:
     except NotFoundError:
         await js.create_key_value(api.KeyValueConfig(bucket=config.workflow_bundles_kv_bucket, history=1))
 
+    # KV bucket (YAML schedule definitions)
+    try:
+        await js.key_value(config.yaml_schedules_kv_bucket)
+    except NotFoundError:
+        await js.create_key_value(api.KeyValueConfig(bucket=config.yaml_schedules_kv_bucket, history=5))
+
     # KV bucket (bundle run relation / audit trail)
     try:
         await js.key_value(config.run_relations_kv_bucket)

@@ -453,6 +453,8 @@ class PyocoNatsWorker:
             run_ctx.metadata["workflow_yaml_sha256"] = job.workflow_yaml_sha256
         if job.workflow_yaml_bytes is not None:
             run_ctx.metadata["workflow_yaml_bytes"] = int(job.workflow_yaml_bytes)
+        if job.schedule_id:
+            run_ctx.metadata["schedule_id"] = job.schedule_id
         if job.workflow_bundle_sha256:
             run_ctx.metadata["bundle_hash"] = job.workflow_bundle_sha256
         if job.workflow_bundle_bytes is not None:
@@ -595,18 +597,29 @@ class PyocoNatsWorker:
             max_snapshot_bytes=int(getattr(self._config, "max_run_snapshot_bytes", 0) or 0),
         )
         engine = Engine(trace_backend=backend)
+        existing_cancel_at, existing_cancel_by = _extract_cancel_request(existing_snapshot)
         cancel_state: dict[str, Any] = {
-            "requested": False,
-            "requested_at": None,
-            "requested_by": None,
+            "requested": (existing_cancel_at is not None),
+            "requested_at": existing_cancel_at,
+            "requested_by": existing_cancel_by,
             "timeout_logged": False,
         }
+        if existing_cancel_at is not None:
+            run_ctx.metadata["cancel_requested_at"] = float(existing_cancel_at)
+        if existing_cancel_by is not None:
+            run_ctx.metadata["cancel_requested_by"] = existing_cancel_by
 
         heartbeat_task = asyncio.create_task(self._heartbeat_loop(run_ctx, engine, cancel_state))
 
         # Mark worker ownership in snapshot (best-effort).
         snap = run_snapshot_from_context(run_ctx)
         snap["worker_id"] = self._worker_id
+        if cancel_state.get("requested"):
+            snap["cancel_requested_at"] = cancel_state.get("requested_at")
+            if cancel_state.get("requested_by"):
+                snap["cancel_requested_by"] = cancel_state.get("requested_by")
+            if str(snap.get("status") or "").upper() not in {"COMPLETED", "FAILED", "CANCELLED"}:
+                snap["status"] = "CANCELLING"
         snap = compact_run_snapshot(
             snap,
             max_bytes=int(getattr(self._config, "max_run_snapshot_bytes", 0) or 0),
@@ -726,6 +739,7 @@ class PyocoNatsWorker:
                     cancel_state["requested_at"] = float(cancel_state.get("requested_at") or existing_cancel_at)
                     if existing_cancel_by:
                         cancel_state["requested_by"] = existing_cancel_by
+                if cancel_state.get("requested"):
                     run_ctx.metadata["cancel_requested_at"] = cancel_state["requested_at"]
                     if cancel_state.get("requested_by"):
                         run_ctx.metadata["cancel_requested_by"] = cancel_state["requested_by"]
@@ -1195,6 +1209,7 @@ def _decode_job(raw: bytes) -> RunJob:
         workflow_yaml=data.get("workflow_yaml"),
         workflow_yaml_sha256=data.get("workflow_yaml_sha256"),
         workflow_yaml_bytes=data.get("workflow_yaml_bytes"),
+        schedule_id=data.get("schedule_id"),
         workflow_bundle=data.get("workflow_bundle"),
         workflow_bundle_sha256=(data.get("workflow_bundle_sha256") or data.get("bundle_hash")),
         workflow_bundle_bytes=data.get("workflow_bundle_bytes"),

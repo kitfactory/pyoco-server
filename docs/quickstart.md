@@ -24,6 +24,12 @@ uv run pyoco-server up --with-nats-bootstrap --host 127.0.0.1 --port 8000
 - `--with-nats-bootstrap` は `nats-bootstrap` が無いと失敗します。
 - このモードは単体NATS起動のみです（クラスタは後述）。
 
+1コマンドで server と worker をまとめて起動したい場合：
+
+```bash
+uv run pyoco-server up --with-nats-bootstrap --with-worker --worker-id w1 --worker-tags hello --host 127.0.0.1 --port 8000
+```
+
 ## 2) Worker を起動する
 
 別ターミナルで実行します。

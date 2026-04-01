@@ -43,6 +43,7 @@ HTTP Gateway の app factory は以下です。
 - `nats_url`
 - `work_stream`, `work_subject_prefix`
 - `runs_kv_bucket`, `workers_kv_bucket`
+- `yaml_schedules_kv_bucket`
 - `consumer_ack_wait_sec`, `consumer_max_deliver`, `consumer_max_ack_pending`
 - `ack_progress_interval_sec`
 - `dlq_stream`, `dlq_subject_prefix`, `dlq_publish_execution_error`
@@ -51,6 +52,7 @@ HTTP Gateway の app factory は以下です。
 - `wheel_install_timeout_sec`, `wheel_max_bytes`
 - `wheel_history_kv_bucket`, `wheel_history_ttl_sec`
 - `workflow_yaml_max_bytes`
+- `schedule_poll_interval_sec`
 
 env からの生成：
 - `NatsBackendConfig.from_env() -> NatsBackendConfig`
@@ -66,6 +68,7 @@ env からの生成：
 - JetStream リソースが存在することを保証します。
   - Work stream（`PYOCO_WORK`）
   - runスナップショットKV（`pyoco_runs`）
+  - YAML schedule KV（`pyoco_yaml_schedules`）
   - worker生死KV（`pyoco_workers`）
   - 認証KV（`pyoco_auth`）
   - DLQ stream（`PYOCO_DLQ`）
@@ -139,6 +142,10 @@ API：
 API：
 - `client.submit_run(flow_name, params, tag=..., tags=...) -> dict`
 - `client.submit_run_yaml(workflow_yaml, flow_name=..., tag=...) -> dict`
+- `client.create_yaml_schedule(workflow_yaml, flow_name=..., tag=..., run_at=..., interval_seconds=..., start_at=...) -> dict`
+- `client.list_schedules() -> list[dict]`
+- `client.list_schedule_runs(schedule_id, include_records=False, limit=...) -> list[dict]`
+- `client.delete_schedule(schedule_id) -> dict`
 - `client.submit_bundle_yaml(bundle_yaml) -> dict`
   - 複数workflowと `submit.entry_workflow` を含む bundle を投入します。
 - `client.get_run(run_id) -> dict`
@@ -177,6 +184,7 @@ API：
 - gateway は運用向けDashboard UIを静的配信します（`GET /` / `GET /static/*`）。
 - gateway は wheel registry API（`GET/POST /wheels`, `GET/DELETE /wheels/{wheel_name}`）を提供します。
 - gateway は wheel配布履歴 API（`GET /wheels/history`）を提供します。
+- gateway は YAML schedule API（`POST /schedules/yaml`, `GET /schedules`, `GET /schedules/{schedule_id}/runs`, `DELETE /schedules/{schedule_id}`）を提供します。
 - gateway は bundle submit / approval API（`POST /runs/bundle`, `POST /runs/{run_id}/approve`, `POST /runs/{run_id}/reject`）を提供します。
 
 ログ：
@@ -210,6 +218,7 @@ Phase 3（v0.3 opt-in）では、API key 管理用に `python -m pyoco_server.ad
 - `watch` は `--output json|status` をサポートします。
 - wheel配布は `wheels` / `wheel-upload` / `wheel-delete` をサポートします。
 - 履歴参照は `wheel-history` をサポートします。
+- YAML schedule は `schedule-yaml` / `schedules` / `schedule-runs` / `schedule-delete` をサポートします。
 - `wheel-upload --wheel-file <path> [--tags cpu,linux] [--replace|--no-replace]`
 - `wheel-upload` は同一パッケージでバージョンを必ず上げてください（同一/過去バージョンは409）。
 - 利用者が修正可能な失敗は exit code `1` で終了し、stderr に修正例を表示します。

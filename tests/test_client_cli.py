@@ -63,6 +63,59 @@ class _FakeClient:
         self.calls.append(("submit_run_yaml", {"workflow_yaml": workflow_yaml, "flow_name": flow_name, "tag": tag}))
         return {"run_id": "r-yaml", "status": "PENDING"}
 
+    def create_yaml_schedule(
+        self,
+        workflow_yaml: str,
+        *,
+        flow_name: str,
+        tag: str,
+        run_at: str | None = None,
+        interval_seconds: float | None = None,
+        start_at: str | None = None,
+    ):
+        self.calls.append(
+            (
+                "create_yaml_schedule",
+                {
+                    "workflow_yaml": workflow_yaml,
+                    "flow_name": flow_name,
+                    "tag": tag,
+                    "run_at": run_at,
+                    "interval_seconds": interval_seconds,
+                    "start_at": start_at,
+                },
+            )
+        )
+        return {
+            "schedule_id": "sch-1",
+            "status": "ACTIVE",
+            "schedule_type": ("once" if run_at else "interval"),
+            "next_run_at": 123.0,
+            "flow_name": flow_name,
+            "tag": tag,
+            "workflow_yaml_bytes": len(workflow_yaml.encode("utf-8")),
+            "created_at": 1.0,
+            "updated_at": 1.0,
+            "dispatch_count": 0,
+        }
+
+    def list_schedules(self):
+        self.calls.append(("list_schedules", {}))
+        return [{"schedule_id": "sch-1", "status": "ACTIVE"}]
+
+    def list_schedule_runs(self, schedule_id: str, *, include_records: bool = False, limit: int | None = None):
+        self.calls.append(
+            (
+                "list_schedule_runs",
+                {"schedule_id": schedule_id, "include_records": include_records, "limit": limit},
+            )
+        )
+        return [{"run_id": "r-sch-1", "schedule_id": schedule_id, "status": "COMPLETED"}]
+
+    def delete_schedule(self, schedule_id: str):
+        self.calls.append(("delete_schedule", {"schedule_id": schedule_id}))
+        return {"schedule_id": schedule_id, "deleted": True}
+
     def get_run(self, run_id: str):
         self.calls.append(("get_run", {"run_id": run_id}))
         return {"run_id": run_id, "status": "RUNNING"}
@@ -295,6 +348,72 @@ def test_client_cli_submit_yaml(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     assert rc == 0
     assert json.loads(out)["run_id"] == "r-yaml"
     assert _FakeClient.instances[-1].calls[0][0] == "submit_run_yaml"
+
+
+def test_client_cli_schedule_yaml_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_fake()
+    monkeypatch.setattr(client_cli, "PyocoHttpClient", _FakeClient)
+    workflow = tmp_path / "flow.yaml"
+    workflow.write_text("version: 1\nflow:\n  graph: |\n    a\n", encoding="utf-8")
+
+    rc = client_cli.main(
+        [
+            "schedule-yaml",
+            "--workflow-file",
+            str(workflow),
+            "--flow-name",
+            "train",
+            "--tag",
+            "cpu",
+            "--run-at",
+            "2026-04-02T10:00:00+09:00",
+        ]
+    )
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert json.loads(out)["schedule_id"] == "sch-1"
+    call = _FakeClient.instances[-1].calls[0]
+    assert call[0] == "create_yaml_schedule"
+    assert call[1]["run_at"] == "2026-04-02T10:00:00+09:00"
+    assert call[1]["interval_seconds"] is None
+
+
+def test_client_cli_schedule_list_and_delete(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_fake()
+    monkeypatch.setattr(client_cli, "PyocoHttpClient", _FakeClient)
+
+    rc_list = client_cli.main(["schedules"])
+    out_list = capsys.readouterr().out.strip()
+    assert rc_list == 0
+    assert json.loads(out_list)[0]["schedule_id"] == "sch-1"
+
+    rc_delete = client_cli.main(["schedule-delete", "--schedule-id", "sch-1"])
+    out_delete = capsys.readouterr().out.strip()
+    assert rc_delete == 0
+    assert json.loads(out_delete)["deleted"] is True
+
+
+def test_client_cli_schedule_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _reset_fake()
+    monkeypatch.setattr(client_cli, "PyocoHttpClient", _FakeClient)
+
+    rc = client_cli.main(["schedule-runs", "--schedule-id", "sch-1", "--limit", "10", "--records"])
+    out = capsys.readouterr().out.strip()
+    assert rc == 0
+    assert json.loads(out)[0]["run_id"] == "r-sch-1"
+    call = _FakeClient.instances[-1].calls[0]
+    assert call[0] == "list_schedule_runs"
+    assert call[1] == {"schedule_id": "sch-1", "include_records": True, "limit": 10}
 
 
 def test_client_cli_watch_until_terminal(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:

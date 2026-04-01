@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -82,7 +83,7 @@ def test_http_wheel_registry_endpoints_upload_list_download_delete():
             }
             http_proc = subprocess.Popen(
                 [
-                    ".venv/bin/python",
+                    sys.executable,
                     "-m",
                     "uvicorn",
                     "pyoco_server.http_api:create_app",
@@ -192,7 +193,7 @@ def test_http_wheel_registry_upload_requires_strict_version_bump():
             }
             http_proc = subprocess.Popen(
                 [
-                    ".venv/bin/python",
+                    sys.executable,
                     "-m",
                     "uvicorn",
                     "pyoco_server.http_api:create_app",

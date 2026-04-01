@@ -6,7 +6,7 @@
 
 ## 現在地（必ず更新）
 - 現在フェーズ: Phase 4（v0.4：YAML（flow.yaml）投入の運用I/F）
-- 現在のバージョン（実装の区切り）: v0.5.1
+- 現在のバージョン（実装の区切り）: v0.7.0
 - 今回スコープ（1〜5行）:
   - pyoco 0.6.2（single-flow: `flow:`）に合わせ、`flow.yaml`（YAML）を multipart で投入できるようにする（`POST /runs/yaml`）
   - params は `flow.defaults` を正本とし、HTTP側の上書きI/Fは初期は提供しない
@@ -17,6 +17,7 @@
   - Dashboard文言の日英切替（サーバーロケールを既定とし、`PYOCO_DASHBOARD_LANG` / `pyoco-server --dashboard-lang` で指定可能）
   - `NatsBackendConfig.from_env()` で `.env` 自動読込に対応（`PYOCO_LOAD_DOTENV` / `PYOCO_ENV_FILE`）
   - `pyoco-server up --with-nats-bootstrap` で単体NATSを同時起動可能（任意依存、未導入時は明示エラー）
+  - `pyoco-server up --with-worker` で managed worker 1台を同時起動可能（`--worker-id` / `--worker-tags` / `--worker-flow-resolver` / `--worker-poll-timeout`）
   - CLIの使い勝手改善を反映済み（`submit` の入力簡略化、`list/watch` の出力モード、修正例付きエラー表示）
   - `pyoco-client wheel-upload` に client-side preflight を追加（既定 `strict`。`entry_points` と使用説明の検査）
   - 完了スコープ：Workers運用可視化の拡張（停止種別の区別、手動hide、運用表示改善）
@@ -24,6 +25,8 @@
   - wheelレジストリ（JetStream Object Store）を追加し、`/wheels` API（list/upload/download/delete/history）と worker の wheel 同期・差分インストール（opt-in）を実装（wheelタグとworkerタグの一致で配布）
   - wheelアップロードは同一パッケージで「必ずバージョンアップ」を必須化（同一/過去バージョンは 409 で拒否）
   - Spawn / YAML bundle を実装し、`POST /runs/bundle`、`POST /runs/{run_id}/approve`、`POST /runs/{run_id}/reject`、bundle hash / parent-child relation / child result summary / child 再spawn禁止を追加（review gate 待ち）
+  - YAML スケジュール実行を実装し、`POST /schedules/yaml` / `GET /schedules` / `DELETE /schedules/{schedule_id}` と server 側 dispatch loop で one-shot / interval 実行を追加
+  - schedule 単位の run 一覧取得を追加し、`GET /schedules/{schedule_id}/runs` と `pyoco-client schedule-runs` で繰り返し実行結果を参照可能にする
   - 文書方針を更新し、`pyoco-server` の位置づけを「軽量な分散実行バックエンド（社内システム向け最適化）」として明文化する
   - `nats-bootstrap` 連携の価値（対称運用 / Day-2運用）と現行制約（backup/restore・leave/controller・down）を README / docs 全体で整合させる
 - 非ゴール（やらないこと）:
@@ -66,6 +69,8 @@
     - `GET /wheels` / `POST /wheels` / `GET /wheels/{wheel_name}` / `DELETE /wheels/{wheel_name}` / `GET /wheels/history` -> wheel registry 管理/履歴参照
     - `POST /runs` -> KV snapshot + JetStream publish
     - `POST /runs/yaml` -> KV snapshot + JetStream publish（job payload に workflow_yaml を埋め込む）
+    - `POST /schedules/yaml` / `GET /schedules` / `DELETE /schedules/{schedule_id}` -> YAML schedule 定義の作成/参照/削除
+    - `GET /schedules/{schedule_id}/runs` -> 指定 schedule 由来 run の一覧取得
     - `GET /runs/{run_id}` -> snapshot (+任意のliveness付加) with `include=records`
     - `GET /runs/{run_id}/watch` -> SSE で run snapshot 更新を配信
     - `GET /runs/{run_id}/tasks` -> tasks + records + truncation flag
@@ -83,6 +88,7 @@
     - 長時間run: JetStream `in_progress` ACK（AckWait対策）
     - 失敗ディスポジション: ACK/NAK/TERM + DLQ publish（best-effort）
   - Resources: `src/pyoco_server/resources.py`（stream/KV/DLQ bootstrapping）
+  - YAML schedules: `src/pyoco_server/schedules.py`（schedule record 正規化、時刻計算、dispatch 後更新）
   - DLQ helper: `src/pyoco_server/dlq.py`
   - Snapshot model/compaction: `src/pyoco_server/models.py`
   - Trace->KV bridge: `src/pyoco_server/trace.py`
@@ -93,6 +99,7 @@
     - `pyoco-worker` -> `src/pyoco_server/worker_cli.py`
     - `pyoco-client` -> `src/pyoco_server/client_cli.py`
     - `pyoco-server-admin` -> `src/pyoco_server/admin_cli.py`
+    - `pyoco-server up` は `--with-worker` で managed worker を co-launch できる
 - テスト（ベースライン）
   - E2E（NATS + worker + HTTP gateway）: `tests/test_nats_e2e.py`
   - E2E（wheel registry + worker sync）: `tests/test_wheel_registry.py`

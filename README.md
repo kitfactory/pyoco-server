@@ -5,7 +5,7 @@ pyoco-server (NATS backend for Pyoco)
 It is optimized for internal systems (single organization, small ops team),
 not for a large strict multi-tenant platform.
 
-Version: 0.5.1
+Version: 0.7.0
 
 Positioning
 -----------

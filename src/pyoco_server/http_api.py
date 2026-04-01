@@ -25,7 +25,7 @@ from nats.js import api
 from pydantic import BaseModel, Field
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 from packaging.version import Version
-from nats.js.errors import KeyNotFoundError, NotFoundError, ObjectNotFoundError
+from nats.js.errors import KeyDeletedError, KeyNotFoundError, NoKeysError, NotFoundError, ObjectNotFoundError
 from nats.errors import Error as NatsError
 
 from .auth import ApiKeyError, ApiKeyRecord, make_kv_key_for_api_key_id, parse_api_key, verify_api_key
@@ -47,6 +47,16 @@ from .models import (
     normalize_worker_registry_record,
 )
 from .resources import ensure_resources
+from .schedules import (
+    SCHEDULE_TYPE_INTERVAL,
+    SCHEDULE_TYPE_ONCE,
+    advance_schedule_after_dispatch,
+    build_schedule_record,
+    is_schedule_due,
+    normalize_schedule_record,
+    parse_schedule_datetime,
+    schedule_record_for_http,
+)
 from .workflow_yaml import (
     WorkflowYamlValidationError,
     extract_flow_defaults,
@@ -249,6 +259,33 @@ class WorkerPatchRequest(BaseModel):
     hidden: bool
 
 
+class YamlScheduleResponse(BaseModel):
+    schedule_id: str
+    flow_name: str
+    tag: str
+    status: str
+    schedule_type: str
+    workflow_yaml_sha256: Optional[str] = None
+    workflow_yaml_bytes: int
+    tenant_id: Optional[str] = None
+    api_key_id: Optional[str] = None
+    created_at: float
+    updated_at: float
+    run_at: Optional[float] = None
+    next_run_at: Optional[float] = None
+    interval_seconds: Optional[float] = None
+    start_at: Optional[float] = None
+    last_submitted_at: Optional[float] = None
+    last_run_id: Optional[str] = None
+    dispatch_count: int = 0
+    last_error: Optional[str] = None
+
+
+class ScheduleDeleteResponse(BaseModel):
+    schedule_id: str
+    deleted: bool
+
+
 @dataclass(frozen=True)
 class _AuthContext:
     tenant_id: str
@@ -276,6 +313,7 @@ def _filter_snapshot_for_http(
         # Summary-only list items.
         keys = {
             "run_id",
+            "schedule_id",
             "flow_name",
             "tag",
             "tags",
@@ -306,7 +344,7 @@ def create_app() -> FastAPI:
 
     configure_logging(service="pyoco-server:http")
     config = config_from_env()
-    app = FastAPI(title="pyoco-server (HTTP gateway)", version="0.5.1")
+    app = FastAPI(title="pyoco-server (HTTP gateway)", version="0.7.0")
     logger = logging.getLogger("pyoco_server.http_api")
     static_dir = Path(__file__).resolve().parent / "static"
     dashboard_lang = _resolve_dashboard_lang(config)
@@ -436,6 +474,259 @@ def create_app() -> FastAPI:
             return None
         return f"api_key:{auth.api_key_id}"
 
+    def _normalize_routing_tag(raw_tag: Optional[str]) -> str:
+        cfg: NatsBackendConfig = app.state.config
+        routing_tag = (raw_tag or cfg.default_tag).strip()
+        if not routing_tag:
+            routing_tag = cfg.default_tag
+        if "." in routing_tag or not re.fullmatch(r"[A-Za-z0-9_-]+", routing_tag or ""):
+            raise HTTPException(status_code=422, detail="invalid tag")
+        return routing_tag
+
+    async def _submit_yaml_run_internal(
+        *,
+        flow_name: str,
+        routing_tag: str,
+        workflow_yaml_text: str,
+        workflow_yaml_sha256: str,
+        workflow_yaml_bytes: int,
+        params: Dict[str, Any],
+        tenant_id: Optional[str],
+        api_key_id: Optional[str],
+        schedule_id: Optional[str] = None,
+        submitted_at: Optional[float] = None,
+    ) -> RunSubmitResponse:
+        js = app.state.js
+        kv = app.state.runs_kv
+        cfg: NatsBackendConfig = app.state.config
+        run_id = str(uuid.uuid4())
+        now = float(time.time() if submitted_at is None else submitted_at)
+        stored_tags = [routing_tag]
+
+        try:
+            await kv.put(
+                run_id,
+                json.dumps(
+                    {
+                        "run_id": run_id,
+                        "flow_name": flow_name,
+                        "tag": routing_tag,
+                        "tags": stored_tags,
+                        "tenant_id": tenant_id,
+                        "api_key_id": api_key_id,
+                        "workflow_yaml_sha256": workflow_yaml_sha256,
+                        "workflow_yaml_bytes": int(workflow_yaml_bytes),
+                        "schedule_id": schedule_id,
+                        "status": "PENDING",
+                        "params": params,
+                        "tasks": {},
+                        "task_records": {},
+                        "start_time": None,
+                        "end_time": None,
+                        "heartbeat_at": now,
+                        "updated_at": now,
+                        "error": None,
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+            )
+
+            await js.publish(
+                subject=f"{cfg.work_subject_prefix}.{routing_tag}",
+                payload=json.dumps(
+                    {
+                        "run_id": run_id,
+                        "flow_name": flow_name,
+                        "tag": routing_tag,
+                        "tags": stored_tags,
+                        "tenant_id": tenant_id,
+                        "api_key_id": api_key_id,
+                        "params": params,
+                        "workflow_yaml": workflow_yaml_text,
+                        "workflow_yaml_sha256": workflow_yaml_sha256,
+                        "workflow_yaml_bytes": int(workflow_yaml_bytes),
+                        "schedule_id": schedule_id,
+                        "submitted_at": now,
+                    },
+                    ensure_ascii=True,
+                    separators=(",", ":"),
+                ).encode("utf-8"),
+                stream=cfg.work_stream,
+            )
+        except NatsError as exc:
+            try:
+                await kv.delete(run_id)
+            except Exception:
+                pass
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}") from exc
+
+        return RunSubmitResponse(run_id=run_id, status="PENDING")
+
+    async def _list_schedule_records(*, auth: Optional[_AuthContext]) -> list[Dict[str, Any]]:
+        schedules_kv = app.state.yaml_schedules_kv
+        try:
+            keys = await schedules_kv.keys()
+        except NoKeysError:
+            keys = []
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}") from exc
+        except Exception:
+            keys = []
+
+        out: list[Dict[str, Any]] = []
+        for key in list(keys or []):
+            try:
+                entry = await schedules_kv.get(key)
+            except (KeyNotFoundError, KeyDeletedError):
+                continue
+            raw = json.loads(entry.value.decode("utf-8"))
+            record = normalize_schedule_record(raw, schedule_id=key)
+            if auth is not None and record.get("tenant_id") != auth.tenant_id:
+                continue
+            out.append(record)
+
+        out.sort(
+            key=lambda item: (
+                0 if str(item.get("status") or "").upper() == "ACTIVE" else 1,
+                float(item.get("next_run_at") or item.get("created_at") or 0.0),
+                str(item.get("schedule_id") or ""),
+            )
+        )
+        return out
+
+    async def _list_run_snapshots(
+        *,
+        auth: Optional[_AuthContext],
+        status: Optional[str] = None,
+        flow: Optional[str] = None,
+        tag: Optional[str] = None,
+        workflow_yaml_sha256: Optional[str] = None,
+        schedule_id: Optional[str] = None,
+        include: Optional[set[str]] = None,
+    ) -> list[Dict[str, Any]]:
+        kv = app.state.runs_kv
+        include_set = set(include or [])
+        try:
+            keys = await kv.keys()
+        except NatsError as exc:
+            logger.exception(
+                "list_runs failed: nats unavailable",
+                extra={"err_id": "ERR-PYOCO-0003", "msg_id": "MSG-PYOCO-0003"},
+            )
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}")
+        except Exception:
+            keys = []
+
+        snaps: list[Dict[str, Any]] = []
+        for key in list(keys or []):
+            try:
+                entry = await kv.get(key)
+            except KeyNotFoundError:
+                continue
+            snap = json.loads(entry.value.decode("utf-8"))
+            if auth is not None and snap.get("tenant_id") != auth.tenant_id:
+                continue
+            if status and snap.get("status") != status:
+                continue
+            if flow and snap.get("flow_name") != flow:
+                continue
+            if tag and snap.get("tag") != tag:
+                continue
+            if workflow_yaml_sha256 and snap.get("workflow_yaml_sha256") != workflow_yaml_sha256:
+                continue
+            if schedule_id and snap.get("schedule_id") != schedule_id:
+                continue
+            snaps.append(_filter_snapshot_for_http(snap, include=include_set, mode="list"))
+
+        snaps.sort(key=_snapshot_sort_key, reverse=True)
+        return snaps
+
+    async def _dispatch_due_schedules_once() -> None:
+        schedules_kv = app.state.yaml_schedules_kv
+        cfg: NatsBackendConfig = app.state.config
+        try:
+            keys = await schedules_kv.keys()
+        except NoKeysError:
+            return
+        except Exception:
+            logger.exception(
+                "schedule scan failed",
+                extra={"err_id": "ERR-PYOCO-0003", "msg_id": "MSG-PYOCO-0003"},
+            )
+            return
+
+        poll_interval = max(0.2, float(cfg.schedule_poll_interval_sec or 1.0))
+        lease_seconds = max(3.0, poll_interval * 3.0)
+
+        for schedule_id in list(keys or []):
+            try:
+                entry = await schedules_kv.get(schedule_id)
+            except (KeyNotFoundError, KeyDeletedError):
+                continue
+            except Exception:
+                logger.exception("schedule fetch failed", extra={"schedule_id": schedule_id})
+                continue
+
+            record = normalize_schedule_record(json.loads(entry.value.decode("utf-8")), schedule_id=schedule_id)
+            now = time.time()
+            if not is_schedule_due(record, now=now):
+                continue
+
+            claimed = dict(record)
+            claimed["lease_until"] = now + lease_seconds
+            claimed["updated_at"] = now
+
+            try:
+                claimed_revision = await schedules_kv.update(
+                    schedule_id,
+                    json.dumps(claimed, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+                    last=getattr(entry, "revision", None),
+                )
+            except Exception:
+                continue
+
+            try:
+                submitted = await _submit_yaml_run_internal(
+                    flow_name=str(claimed.get("flow_name") or ""),
+                    routing_tag=str(claimed.get("tag") or ""),
+                    workflow_yaml_text=str(claimed.get("workflow_yaml") or ""),
+                    workflow_yaml_sha256=str(claimed.get("workflow_yaml_sha256") or ""),
+                    workflow_yaml_bytes=int(claimed.get("workflow_yaml_bytes") or 0),
+                    params=dict(claimed.get("params") or {}),
+                    tenant_id=claimed.get("tenant_id"),
+                    api_key_id=claimed.get("api_key_id"),
+                    schedule_id=str(claimed.get("schedule_id") or schedule_id),
+                    submitted_at=time.time(),
+                )
+                finalized = advance_schedule_after_dispatch(claimed, submitted_at=time.time())
+                finalized["last_run_id"] = submitted.run_id
+                await schedules_kv.update(
+                    schedule_id,
+                    json.dumps(finalized, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+                    last=claimed_revision,
+                )
+            except Exception as exc:
+                logger.exception("schedule dispatch failed", extra={"schedule_id": schedule_id})
+                failed = dict(claimed)
+                failed["lease_until"] = None
+                failed["updated_at"] = time.time()
+                failed["last_error"] = f"{exc.__class__.__name__}: {exc}"
+                try:
+                    await schedules_kv.update(
+                        schedule_id,
+                        json.dumps(failed, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+                        last=claimed_revision,
+                    )
+                except Exception:
+                    pass
+
+    async def _schedule_loop() -> None:
+        interval = max(0.2, float(config.schedule_poll_interval_sec or 1.0))
+        while True:
+            await _dispatch_due_schedules_once()
+            await asyncio.sleep(interval)
+
     @app.on_event("startup")
     async def _startup() -> None:
         nc = await nats.connect(config.nats_url, name="pyoco-http-api")
@@ -445,6 +736,7 @@ def create_app() -> FastAPI:
         app.state.js = js
         app.state.runs_kv = await js.key_value(config.runs_kv_bucket)
         app.state.workflow_bundles_kv = await js.key_value(config.workflow_bundles_kv_bucket)
+        app.state.yaml_schedules_kv = await js.key_value(config.yaml_schedules_kv_bucket)
         app.state.run_relations_kv = await js.key_value(config.run_relations_kv_bucket)
         app.state.workers_kv = await js.key_value(config.workers_kv_bucket)
         app.state.auth_kv = await js.key_value(config.auth_kv_bucket)
@@ -452,9 +744,17 @@ def create_app() -> FastAPI:
         app.state.wheel_history_kv = await js.key_value(config.wheel_history_kv_bucket)
         app.state.config = config
         app.state.dashboard_lang = dashboard_lang
+        app.state.schedule_task = asyncio.create_task(_schedule_loop())
 
     @app.on_event("shutdown")
     async def _shutdown() -> None:
+        schedule_task = getattr(app.state, "schedule_task", None)
+        if schedule_task is not None:
+            schedule_task.cancel()
+            try:
+                await schedule_task
+            except asyncio.CancelledError:
+                pass
         nc = getattr(app.state, "nc", None)
         if nc is not None:
             await nc.close()
@@ -501,9 +801,14 @@ def create_app() -> FastAPI:
         for key in list(run_keys or []):
             try:
                 entry = await runs_kv.get(key)
-            except KeyNotFoundError:
+            except (KeyNotFoundError, KeyDeletedError):
                 continue
-            snap = json.loads(entry.value.decode("utf-8"))
+            except Exception:
+                continue
+            try:
+                snap = json.loads(entry.value.decode("utf-8"))
+            except Exception:
+                continue
             st = str(snap.get("status") or "UNKNOWN")
             status_counts[st] = status_counts.get(st, 0) + 1
             try:
@@ -527,7 +832,7 @@ def create_app() -> FastAPI:
         for key in list(worker_keys or []):
             try:
                 entry = await workers_kv.get(key)
-            except KeyNotFoundError:
+            except (KeyNotFoundError, KeyDeletedError):
                 continue
             except Exception:
                 continue
@@ -1075,20 +1380,17 @@ def create_app() -> FastAPI:
         単体flow（flow.yaml）を run として投入します。
         """
 
-        js = app.state.js
-        kv = app.state.runs_kv
         cfg: NatsBackendConfig = app.state.config
         auth = await _require_auth(request)
 
-        routing_tag = (tag or cfg.default_tag).strip()
-        if not routing_tag:
-            routing_tag = cfg.default_tag
-        if "." in routing_tag or not re.fullmatch(r"[A-Za-z0-9_-]+", routing_tag or ""):
+        try:
+            routing_tag = _normalize_routing_tag(tag)
+        except HTTPException:
             logger.info(
                 "submit yaml failed: invalid tag",
-                extra={"err_id": "ERR-PYOCO-0002", "msg_id": "MSG-PYOCO-0002", "tag": routing_tag},
+                extra={"err_id": "ERR-PYOCO-0002", "msg_id": "MSG-PYOCO-0002", "tag": tag},
             )
-            raise HTTPException(status_code=422, detail="invalid tag")
+            raise
 
         raw = await workflow.read()
         if len(raw) > int(cfg.workflow_yaml_max_bytes or 0):
@@ -1120,9 +1422,7 @@ def create_app() -> FastAPI:
         # params は flow.defaults を正本とする（上書きI/Fは提供しない）。
         params = extract_flow_defaults(parsed)
 
-        run_id = str(uuid.uuid4())
         now = time.time()
-        stored_tags = [routing_tag]
         flow_name = (flow_name or "").strip()
         if not flow_name:
             logger.info(
@@ -1132,55 +1432,18 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=422, detail="missing flow_name")
 
         try:
-            await kv.put(
-                run_id,
-                json.dumps(
-                    {
-                        "run_id": run_id,
-                        "flow_name": flow_name,
-                        "tag": routing_tag,
-                        "tags": stored_tags,
-                        "tenant_id": (auth.tenant_id if auth else None),
-                        "api_key_id": (auth.api_key_id if auth else None),
-                        "workflow_yaml_sha256": parsed.sha256,
-                        "workflow_yaml_bytes": parsed.size_bytes,
-                        "status": "PENDING",
-                        "params": params,
-                        "tasks": {},
-                        "task_records": {},
-                        "start_time": None,
-                        "end_time": None,
-                        "heartbeat_at": now,
-                        "updated_at": now,
-                        "error": None,
-                    },
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                ).encode("utf-8"),
+            return await _submit_yaml_run_internal(
+                flow_name=flow_name,
+                routing_tag=routing_tag,
+                workflow_yaml_text=raw.decode("utf-8"),
+                workflow_yaml_sha256=parsed.sha256,
+                workflow_yaml_bytes=parsed.size_bytes,
+                params=params,
+                tenant_id=(auth.tenant_id if auth else None),
+                api_key_id=(auth.api_key_id if auth else None),
+                submitted_at=now,
             )
-
-            await js.publish(
-                subject=f"{cfg.work_subject_prefix}.{routing_tag}",
-                payload=json.dumps(
-                    {
-                        "run_id": run_id,
-                        "flow_name": flow_name,
-                        "tag": routing_tag,
-                        "tags": stored_tags,
-                        "tenant_id": (auth.tenant_id if auth else None),
-                        "api_key_id": (auth.api_key_id if auth else None),
-                        "params": params,
-                        "workflow_yaml": raw.decode("utf-8"),
-                        "workflow_yaml_sha256": parsed.sha256,
-                        "workflow_yaml_bytes": parsed.size_bytes,
-                        "submitted_at": now,
-                    },
-                    ensure_ascii=True,
-                    separators=(",", ":"),
-                ).encode("utf-8"),
-                stream=cfg.work_stream,
-            )
-        except NatsError as exc:
+        except HTTPException as exc:
             logger.exception(
                 "submit yaml failed: nats unavailable",
                 extra={
@@ -1188,16 +1451,149 @@ def create_app() -> FastAPI:
                     "msg_id": "MSG-PYOCO-0003",
                     "flow_name": flow_name,
                     "tag": routing_tag,
-                    "run_id": run_id,
                 },
             )
-            try:
-                await kv.delete(run_id)
-            except Exception:
-                pass
-            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}")
+            raise exc
 
-        return RunSubmitResponse(run_id=run_id, status="PENDING")
+    @app.post("/schedules/yaml", response_model=YamlScheduleResponse)
+    async def create_yaml_schedule(
+        request: Request,
+        workflow: UploadFile = File(...),
+        flow_name: str = Form(...),
+        tag: Optional[str] = Form(default=None),
+        run_at: Optional[str] = Form(default=None),
+        interval_seconds: Optional[float] = Form(default=None),
+        start_at: Optional[str] = Form(default=None),
+    ) -> YamlScheduleResponse:
+        cfg: NatsBackendConfig = app.state.config
+        schedules_kv = app.state.yaml_schedules_kv
+        auth = await _require_auth(request)
+
+        try:
+            routing_tag = _normalize_routing_tag(tag)
+        except HTTPException:
+            raise HTTPException(status_code=422, detail="invalid tag")
+
+        raw = await workflow.read()
+        if len(raw) > int(cfg.workflow_yaml_max_bytes or 0):
+            raise HTTPException(status_code=413, detail="workflow too large")
+
+        try:
+            parsed = parse_workflow_yaml_bytes(raw, require_flow=True)
+        except WorkflowYamlValidationError:
+            raise HTTPException(status_code=422, detail="invalid workflow yaml")
+
+        flow_name = (flow_name or "").strip()
+        if not flow_name:
+            raise HTTPException(status_code=422, detail="missing flow_name")
+
+        has_run_at = bool(str(run_at or "").strip())
+        has_interval = interval_seconds is not None
+        if has_run_at == has_interval:
+            raise HTTPException(status_code=422, detail="specify either run_at or interval_seconds")
+
+        now = time.time()
+        parsed_run_at: Optional[float] = None
+        parsed_start_at: Optional[float] = None
+        schedule_type = SCHEDULE_TYPE_ONCE if has_run_at else SCHEDULE_TYPE_INTERVAL
+
+        if has_run_at:
+            if start_at is not None and str(start_at).strip():
+                raise HTTPException(status_code=422, detail="start_at is only valid with interval_seconds")
+            try:
+                parsed_run_at = parse_schedule_datetime(str(run_at), field_name="run_at")
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            if parsed_run_at <= now:
+                raise HTTPException(status_code=422, detail="run_at must be in the future")
+        else:
+            if float(interval_seconds or 0.0) <= 0.0:
+                raise HTTPException(status_code=422, detail="interval_seconds must be positive")
+            if start_at is not None and str(start_at).strip():
+                try:
+                    parsed_start_at = parse_schedule_datetime(str(start_at), field_name="start_at")
+                except ValueError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        schedule_id = str(uuid.uuid4())
+        record = build_schedule_record(
+            schedule_id=schedule_id,
+            flow_name=flow_name,
+            tag=routing_tag,
+            workflow_yaml=raw.decode("utf-8"),
+            workflow_yaml_sha256=parsed.sha256,
+            workflow_yaml_bytes=parsed.size_bytes,
+            params=extract_flow_defaults(parsed),
+            created_at=now,
+            schedule_type=schedule_type,
+            tenant_id=(auth.tenant_id if auth else None),
+            api_key_id=(auth.api_key_id if auth else None),
+            run_at=parsed_run_at,
+            interval_seconds=interval_seconds,
+            start_at=parsed_start_at,
+        )
+        try:
+            await schedules_kv.put(
+                schedule_id,
+                json.dumps(record, ensure_ascii=True, separators=(",", ":")).encode("utf-8"),
+            )
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}") from exc
+        return YamlScheduleResponse(**schedule_record_for_http(record))
+
+    @app.get("/schedules", response_model=list[YamlScheduleResponse])
+    async def list_yaml_schedules(request: Request) -> list[YamlScheduleResponse]:
+        auth = await _require_auth(request)
+        records = await _list_schedule_records(auth=auth)
+        return [YamlScheduleResponse(**schedule_record_for_http(record)) for record in records]
+
+    @app.get("/schedules/{schedule_id}/runs")
+    async def list_yaml_schedule_runs(
+        schedule_id: str,
+        request: Request,
+        include: list[str] = Query(default=[]),
+        limit: Optional[int] = Query(default=50, ge=1, le=200),
+    ) -> list[Dict[str, Any]]:
+        schedules_kv = app.state.yaml_schedules_kv
+        auth = await _require_auth(request)
+        try:
+            entry = await schedules_kv.get(schedule_id)
+        except (KeyNotFoundError, KeyDeletedError):
+            raise HTTPException(status_code=404, detail="schedule not found")
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}") from exc
+
+        record = normalize_schedule_record(json.loads(entry.value.decode("utf-8")), schedule_id=schedule_id)
+        if auth is not None and record.get("tenant_id") != auth.tenant_id:
+            raise HTTPException(status_code=404, detail="schedule not found")
+
+        snaps = await _list_run_snapshots(
+            auth=auth,
+            schedule_id=schedule_id,
+            include=set(include or []),
+        )
+        return snaps[: int(limit or 50)]
+
+    @app.delete("/schedules/{schedule_id}", response_model=ScheduleDeleteResponse)
+    async def delete_yaml_schedule(schedule_id: str, request: Request) -> ScheduleDeleteResponse:
+        schedules_kv = app.state.yaml_schedules_kv
+        auth = await _require_auth(request)
+        try:
+            entry = await schedules_kv.get(schedule_id)
+        except (KeyNotFoundError, KeyDeletedError):
+            raise HTTPException(status_code=404, detail="schedule not found")
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}") from exc
+
+        record = normalize_schedule_record(json.loads(entry.value.decode("utf-8")), schedule_id=schedule_id)
+        if auth is not None and record.get("tenant_id") != auth.tenant_id:
+            raise HTTPException(status_code=404, detail="schedule not found")
+
+        try:
+            await schedules_kv.delete(schedule_id)
+        except NatsError as exc:
+            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}") from exc
+        return ScheduleDeleteResponse(schedule_id=schedule_id, deleted=True)
 
     @app.post("/runs/bundle", response_model=RunSubmitResponse)
     async def submit_run_bundle(
@@ -1450,12 +1846,15 @@ def create_app() -> FastAPI:
                 snap["worker_hidden"] = bool(winfo.get("hidden") or False)
                 if "tags" in winfo:
                     snap["worker_tags"] = winfo.get("tags")
-            except KeyNotFoundError:
+            except (KeyNotFoundError, KeyDeletedError):
                 snap["worker_alive"] = False
                 snap["worker_state"] = "DISCONNECTED"
                 snap["worker_heartbeat_at"] = None
             except NatsError:
                 # If NATS is unavailable, keep the run snapshot but omit liveness enrichment.
+                pass
+            except Exception:
+                # Liveness enrichment is best-effort; never fail run detail because of worker registry issues.
                 pass
 
         return _filter_snapshot_for_http(snap, include=set(include or []), mode="run")
@@ -1655,10 +2054,10 @@ def create_app() -> FastAPI:
         updated_after: Optional[float] = None,
         cursor: Optional[str] = None,
         workflow_yaml_sha256: Optional[str] = None,
+        schedule_id: Optional[str] = None,
         include: list[str] = Query(default=[]),
         limit: Optional[int] = Query(default=50, ge=1, le=200),
     ) -> Any:
-        kv = app.state.runs_kv
         auth = await _require_auth(request)
         any_vnext = (updated_after is not None) or (cursor is not None) or bool(workflow_yaml_sha256)
 
@@ -1673,43 +2072,20 @@ def create_app() -> FastAPI:
                 )
                 raise HTTPException(status_code=422, detail="invalid list query")
 
-        try:
-            keys = await kv.keys()
-        except NatsError as exc:
-            logger.exception(
-                "list_runs failed: nats unavailable",
-                extra={"err_id": "ERR-PYOCO-0003", "msg_id": "MSG-PYOCO-0003"},
-            )
-            raise HTTPException(status_code=503, detail=f"nats unavailable: {exc.__class__.__name__}")
-        except Exception:
-            keys = []
+        snaps = await _list_run_snapshots(
+            auth=auth,
+            status=status,
+            flow=flow,
+            tag=tag,
+            workflow_yaml_sha256=workflow_yaml_sha256,
+            schedule_id=schedule_id,
+            include=set(include or []),
+        )
 
-        if not keys:
+        if not snaps:
             if any_vnext:
                 return {"items": [], "next_cursor": None}
             return []
-
-        # Newest-first isn't guaranteed in KV; we do best-effort by sorting on updated_at.
-        snaps: list[Dict[str, Any]] = []
-        for key in keys:
-            try:
-                entry = await kv.get(key)
-            except KeyNotFoundError:
-                continue
-            snap = json.loads(entry.value.decode("utf-8"))
-            if auth is not None and snap.get("tenant_id") != auth.tenant_id:
-                continue
-            if status and snap.get("status") != status:
-                continue
-            if flow and snap.get("flow_name") != flow:
-                continue
-            if tag and snap.get("tag") != tag:
-                continue
-            if workflow_yaml_sha256 and snap.get("workflow_yaml_sha256") != workflow_yaml_sha256:
-                continue
-            snaps.append(_filter_snapshot_for_http(snap, include=set(include or []), mode="list"))
-
-        snaps.sort(key=_snapshot_sort_key, reverse=True)
 
         if updated_after is not None:
             snaps = [s for s in snaps if float(s.get("updated_at") or 0.0) > float(updated_after)]

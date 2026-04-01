@@ -208,6 +208,8 @@ def test_dashboard_playwright_e2e_with_auth_and_watch():
                         timeout=20000,
                     )
 
+                    page.check("#wIncludeHidden")
+                    page.uncheck("#wIncludeHidden")
                     page.wait_for_selector("#workersList li:has-text('w-gui-auth')", timeout=10000)
                     assert page.locator("#workersList li:has-text('w-gui-auth') .worker-state").count() >= 1
 

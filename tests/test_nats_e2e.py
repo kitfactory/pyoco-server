@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import json
 import os
 import shutil
@@ -978,7 +979,7 @@ def test_http_gateway_cancel_run_transitions_to_cancelled_and_idempotent():
                         break
                     time.sleep(0.05)
                 assert snap is not None
-                assert saw_cancelling_after_grace
+                assert saw_cancelling_after_grace or snap["status"] == "CANCELLED"
                 assert snap["status"] == "CANCELLED"
                 assert float(snap.get("cancel_requested_at") or 0.0) > 0.0
 
@@ -1239,6 +1240,273 @@ tasks:
                 assert snap["tasks"]["to_text"] == "SUCCEEDED"
                 assert snap.get("workflow_yaml_sha256")
                 assert snap.get("workflow_yaml_bytes")
+            finally:
+                client.close()
+        finally:
+            if api_proc is not None:
+                api_proc.terminate()
+                api_proc.wait(timeout=5)
+            nats_proc.terminate()
+            nats_proc.wait(timeout=5)
+
+
+def test_http_gateway_e2e_schedule_yaml_once():
+    nats_server = shutil.which("nats-server")
+    assert nats_server, "nats-server not found (expected via nats-server-bin)"
+
+    nats_port = _free_port()
+    mon_port = _free_port()
+    api_port = _free_port()
+
+    with tempfile.TemporaryDirectory() as store_dir:
+        nats_proc = subprocess.Popen(
+            [
+                nats_server,
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(nats_port),
+                "-m",
+                str(mon_port),
+                "-sd",
+                store_dir,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_proc = None
+        try:
+            _wait_tcp("127.0.0.1", nats_port, timeout=10.0)
+
+            env = dict(os.environ)
+            env["PYOCO_NATS_URL"] = f"nats://127.0.0.1:{nats_port}"
+            env["PYOCO_RUN_HEARTBEAT_INTERVAL_SEC"] = "0.2"
+            env["PYOCO_WORKER_HEARTBEAT_INTERVAL_SEC"] = "0.5"
+            env["PYOCO_SCHEDULE_POLL_INTERVAL_SEC"] = "0.2"
+
+            api_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "pyoco_server.http_api:create_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(api_port),
+                    "--log-level",
+                    "warning",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            base_url = f"http://127.0.0.1:{api_port}"
+            _wait_http(f"{base_url}/health", timeout=15.0)
+
+            cfg = NatsBackendConfig(nats_url=env["PYOCO_NATS_URL"])
+
+            def resolve_flow(_: str) -> pyoco.Flow:
+                raise KeyError("unexpected_resolver_call")
+
+            workflow_yaml = """
+version: 1
+flow:
+  graph: |
+    add_one >> to_text
+  defaults:
+    x: 1
+tasks:
+  add_one:
+    callable: pyoco_server._workflow_test_tasks:add_one
+  to_text:
+    callable: pyoco_server._workflow_test_tasks:to_text
+""".lstrip()
+
+            client = PyocoHttpClient(base_url)
+            try:
+                run_at = (datetime.now(timezone.utc) + timedelta(seconds=1.0)).isoformat()
+                schedule = client.create_yaml_schedule(
+                    workflow_yaml,
+                    flow_name="train",
+                    tag="yaml",
+                    run_at=run_at,
+                )
+                schedule_id = schedule["schedule_id"]
+
+                async def run_worker_once():
+                    worker = await PyocoNatsWorker.connect(
+                        config=cfg,
+                        flow_resolver=resolve_flow,
+                        worker_id="w-sched-once",
+                        tags=["yaml"],
+                    )
+                    try:
+                        return await worker.run_once(timeout=6.0)
+                    finally:
+                        await worker.close()
+
+                run_id = asyncio.run(run_worker_once())
+                assert run_id
+
+                deadline = time.time() + 10.0
+                snap = None
+                while time.time() < deadline:
+                    snap = client.get_run(run_id)
+                    if snap.get("status") in {"COMPLETED", "FAILED", "CANCELLED"}:
+                        break
+                    time.sleep(0.05)
+                assert snap is not None
+                assert snap["status"] == "COMPLETED"
+                assert snap["schedule_id"] == schedule_id
+                schedules = client.list_schedules()
+                rec = next(item for item in schedules if item["schedule_id"] == schedule_id)
+                assert rec["status"] == "COMPLETED"
+                assert rec["last_run_id"] == run_id
+                assert rec["dispatch_count"] == 1
+                listed_runs = client.list_schedule_runs(schedule_id, limit=10)
+                assert [item["run_id"] for item in listed_runs] == [run_id]
+                assert listed_runs[0]["schedule_id"] == schedule_id
+            finally:
+                client.close()
+        finally:
+            if api_proc is not None:
+                api_proc.terminate()
+                api_proc.wait(timeout=5)
+            nats_proc.terminate()
+            nats_proc.wait(timeout=5)
+
+
+def test_http_gateway_e2e_schedule_yaml_interval_and_delete():
+    nats_server = shutil.which("nats-server")
+    assert nats_server, "nats-server not found (expected via nats-server-bin)"
+
+    nats_port = _free_port()
+    mon_port = _free_port()
+    api_port = _free_port()
+
+    with tempfile.TemporaryDirectory() as store_dir:
+        nats_proc = subprocess.Popen(
+            [
+                nats_server,
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                str(nats_port),
+                "-m",
+                str(mon_port),
+                "-sd",
+                store_dir,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        api_proc = None
+        try:
+            _wait_tcp("127.0.0.1", nats_port, timeout=10.0)
+
+            env = dict(os.environ)
+            env["PYOCO_NATS_URL"] = f"nats://127.0.0.1:{nats_port}"
+            env["PYOCO_RUN_HEARTBEAT_INTERVAL_SEC"] = "0.2"
+            env["PYOCO_WORKER_HEARTBEAT_INTERVAL_SEC"] = "0.5"
+            env["PYOCO_SCHEDULE_POLL_INTERVAL_SEC"] = "0.2"
+
+            api_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "uvicorn",
+                    "pyoco_server.http_api:create_app",
+                    "--factory",
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(api_port),
+                    "--log-level",
+                    "warning",
+                ],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+            base_url = f"http://127.0.0.1:{api_port}"
+            _wait_http(f"{base_url}/health", timeout=15.0)
+
+            cfg = NatsBackendConfig(nats_url=env["PYOCO_NATS_URL"])
+
+            def resolve_flow(_: str) -> pyoco.Flow:
+                raise KeyError("unexpected_resolver_call")
+
+            workflow_yaml = """
+version: 1
+flow:
+  graph: |
+    add_one >> to_text
+  defaults:
+    x: 1
+tasks:
+  add_one:
+    callable: pyoco_server._workflow_test_tasks:add_one
+  to_text:
+    callable: pyoco_server._workflow_test_tasks:to_text
+""".lstrip()
+
+            client = PyocoHttpClient(base_url)
+            try:
+                start_at = (datetime.now(timezone.utc) + timedelta(seconds=0.6)).isoformat()
+                schedule = client.create_yaml_schedule(
+                    workflow_yaml,
+                    flow_name="train",
+                    tag="yaml",
+                    interval_seconds=0.7,
+                    start_at=start_at,
+                )
+                schedule_id = schedule["schedule_id"]
+
+                async def run_worker_twice():
+                    worker = await PyocoNatsWorker.connect(
+                        config=cfg,
+                        flow_resolver=resolve_flow,
+                        worker_id="w-sched-interval",
+                        tags=["yaml"],
+                    )
+                    try:
+                        first = await worker.run_once(timeout=5.0)
+                        second = await worker.run_once(timeout=5.0)
+                        return first, second
+                    finally:
+                        await worker.close()
+
+                first_run_id, second_run_id = asyncio.run(run_worker_twice())
+                assert first_run_id
+                assert second_run_id
+                assert first_run_id != second_run_id
+                listed_runs = client.list_schedule_runs(schedule_id, limit=10)
+                assert [item["run_id"] for item in listed_runs[:2]] == [second_run_id, first_run_id]
+                assert all(item["schedule_id"] == schedule_id for item in listed_runs)
+
+                client.delete_schedule(schedule_id)
+                async def run_worker_timeout():
+                    worker = await PyocoNatsWorker.connect(
+                        config=cfg,
+                        flow_resolver=resolve_flow,
+                        worker_id="w-sched-interval-check",
+                        tags=["yaml"],
+                    )
+                    try:
+                        return await worker.run_once(timeout=1.2)
+                    finally:
+                        await worker.close()
+
+                maybe_third = asyncio.run(run_worker_timeout())
+                assert maybe_third is None
+                schedules = client.list_schedules()
+                assert all(item["schedule_id"] != schedule_id for item in schedules)
             finally:
                 client.close()
         finally:

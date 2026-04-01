@@ -56,6 +56,19 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Start local NATS via nats-bootstrap (single-node) before server startup.",
     )
+    up.add_argument(
+        "--with-worker",
+        action="store_true",
+        help="Start one managed pyoco-worker alongside the HTTP Gateway.",
+    )
+    up.add_argument("--worker-id", default="worker")
+    up.add_argument("--worker-tags", default="default", help="comma-separated worker tags")
+    up.add_argument(
+        "--worker-flow-resolver",
+        default=None,
+        help="module:function or path/to/file.py:function for the managed worker",
+    )
+    up.add_argument("--worker-poll-timeout", type=float, default=None)
     up.add_argument("--nats-listen-host", default="127.0.0.1")
     up.add_argument("--nats-client-port", type=int, default=4222)
     up.add_argument("--nats-http-port", type=int, default=8222)
@@ -113,6 +126,15 @@ def _managed_nats_url(host: str, port: int) -> str:
     return f"nats://{host}:{port}"
 
 
+def _effective_nats_url(args: argparse.Namespace) -> Optional[str]:
+    raw = str(os.environ.get("PYOCO_NATS_URL") or "").strip()
+    if args.with_nats_bootstrap:
+        return _managed_nats_url(args.nats_listen_host, args.nats_client_port)
+    if args.nats_url and str(args.nats_url).strip():
+        return str(args.nats_url).strip()
+    return raw or None
+
+
 def _start_managed_nats(args: argparse.Namespace) -> subprocess.Popen[bytes]:
     nats_bootstrap = _find_nats_bootstrap()
     if not nats_bootstrap:
@@ -150,8 +172,33 @@ def _start_managed_nats(args: argparse.Namespace) -> subprocess.Popen[bytes]:
     return proc
 
 
+def _build_managed_worker_cmd(args: argparse.Namespace) -> list[str]:
+    cmd = [
+        sys.executable,
+        "-m",
+        "pyoco_server.worker_cli",
+        "--worker-id",
+        str(args.worker_id),
+        "--tags",
+        str(args.worker_tags),
+    ]
+    nats_url = _effective_nats_url(args)
+    if nats_url:
+        cmd.extend(["--nats-url", nats_url])
+    if args.worker_flow_resolver:
+        cmd.extend(["--flow-resolver", str(args.worker_flow_resolver)])
+    if args.worker_poll_timeout is not None:
+        cmd.extend(["--poll-timeout", str(args.worker_poll_timeout)])
+    return cmd
+
+
+def _start_managed_worker(args: argparse.Namespace) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(_build_managed_worker_cmd(args))
+
+
 def _run_up(args: argparse.Namespace) -> int:
     managed_proc: Optional[subprocess.Popen[bytes]] = None
+    worker_proc: Optional[subprocess.Popen[bytes]] = None
     try:
         if args.with_nats_bootstrap:
             managed_url = _managed_nats_url(args.nats_listen_host, args.nats_client_port)
@@ -166,6 +213,8 @@ def _run_up(args: argparse.Namespace) -> int:
 
         if args.dashboard_lang:
             os.environ["PYOCO_DASHBOARD_LANG"] = str(args.dashboard_lang)
+        if args.with_worker:
+            worker_proc = _start_managed_worker(args)
 
         uvicorn.run(
             "pyoco_server.http_api:create_app",
@@ -179,6 +228,8 @@ def _run_up(args: argparse.Namespace) -> int:
         _print_cli_error(str(exc))
         return 1
     finally:
+        if worker_proc is not None:
+            _stop_process(worker_proc)
         if managed_proc is not None:
             _stop_process(managed_proc)
 

@@ -1,6 +1,34 @@
 # plan.md（必ず書く：最新版）
 
 # current
+- [x] Delta Request：`DR-20260401-managed-e2e-smoke` を作成し、managed NATS + managed worker の実フロー実行確認に閉じて定義する
+- [x] Delta Apply：`pyoco-server --with-nats-bootstrap --with-worker` を起動し、YAML flow を投入して terminal 収束を観測する
+- [x] Delta Verify：health / run status / worker 観測結果を delta に整理する
+- [x] Delta Archive：`DR-20260401-managed-e2e-smoke` を記録し、plan を更新する
+- [x] Delta Request：`DR-20260401-version-070` を作成し、`pyoco-server` の version metadata / docs 表記を `0.7.0` に閉じて定義する
+- [x] Delta Apply：package / app / README / OVERVIEW の version 表記を `0.7.0` に更新する
+- [x] Delta Verify：version 参照を走査して `0.7.0` 反映を確認する
+- [x] Delta Archive：`DR-20260401-version-070` を記録し、plan を更新する
+- [ ] Delta Request：`DR-20260401-server-with-worker-verify` を作成し、`--with-worker` 追加後の targeted / full test 実行に閉じて定義する
+- [x] Delta Apply：対象テストと full suite を実行し、結果を収集する
+- [x] Delta Verify：実行結果を delta に整理し、通過状況を判定する
+- [ ] Delta Archive：`DR-20260401-server-with-worker-verify` を記録し、plan を更新する
+- [x] Delta Request：`DR-20260401-server-with-worker` を作成し、`pyoco-server up --with-worker` の managed worker co-launch を最小引数セットに閉じて定義する
+- [x] Delta Apply：server CLI に managed worker 起動/停止と最小引数伝播を実装し、server CLI テストと運用文書を更新する
+- [x] Delta Verify：server CLI の対象テストを実行し、`--with-worker` 系の挙動を検証する
+- [x] Delta Archive：`DR-20260401-server-with-worker` を記録し、plan を完了状態へ更新する
+- [x] Delta Request：`DR-20260401-test-fixes` を作成し、full test 失敗 6 件の修復を Windows 互換 / E2E 安定化に閉じて定義する
+- [x] Delta Apply：`worker_cli` の Windows パス解釈、wheel registry テスト起動方法、dashboard / cancel 系失敗の最小修正を適用する
+- [x] Delta Verify：失敗していた対象テストと `uv run pytest` 全体を再実行して green を確認する
+- [x] Delta Archive：`DR-20260401-test-fixes` の記録と `docs/plan.md` を完了状態へ更新する
+- [x] Delta Request：`DR-20260401-schedule-run-list` を作成し、schedule 由来 run 一覧取得を `schedule_id` 伝播 + dedicated API/CLI に閉じる
+- [x] Delta Apply：`GET /schedules/{schedule_id}/runs`、run metadata の `schedule_id`、HTTP client / CLI を追加する
+- [x] Delta Verify：CLI と schedule E2E で schedule run 一覧取得を検証する
+- [x] Delta Archive：schedule run 一覧取得の docs / delta 記録を完了する
+- [x] Delta Request：`DR-20260401-yaml-schedule` を作成し、YAML スケジュール実行の差分を one-shot / interval / create-list-delete / dispatch loop に閉じる
+- [x] Delta Apply：YAML schedule KV、server dispatch loop、`/schedules/yaml` / `/schedules` / `DELETE /schedules/{schedule_id}`、HTTP client / CLI を実装する
+- [x] Delta Verify：config / CLI / E2E で YAML schedule feature の one-shot / interval / delete を検証する
+- [x] Delta Archive：YAML schedule feature の docs 同期と delta 記録を完了する
 - [x] delta運用の修正：1要件を1本の delta で request/apply/verify/archive まで進める前提に見直し、spawn / bundle の細分化した delta を `DR-20260308-spawn-bundle` に統合する（`docs/plan.md` / `docs/delta/DR-20260308-spawn-bundle`）
 - [x] Delta Request：`DR-20260308-spawn-bundle` を Spawn / YAML Bundle 要件の canonical delta として再定義し、docs・設計・実装・テストまでを In Scope に含める
 - [x] Delta Apply：`DR-20260308-spawn-bundle` の範囲で bundle submit / approval API、bundle parser、relation保存、worker spawn orchestration、設定、テストを実装する

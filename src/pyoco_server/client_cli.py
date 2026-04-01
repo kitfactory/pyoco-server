@@ -296,6 +296,24 @@ def _build_parser() -> argparse.ArgumentParser:
     sy.add_argument("--flow-name", required=True)
     sy.add_argument("--tag", required=True)
 
+    sch = sub.add_parser("schedule-yaml", help="Create a scheduled flow.yaml run")
+    sch.add_argument("--workflow-file", required=True, help="path to flow.yaml")
+    sch.add_argument("--flow-name", required=True)
+    sch.add_argument("--tag", required=True)
+    sch.add_argument("--run-at", default=None, help="ISO 8601 datetime with timezone offset")
+    sch.add_argument("--interval-seconds", type=float, default=None)
+    sch.add_argument("--start-at", default=None, help="ISO 8601 datetime with timezone offset")
+
+    sub.add_parser("schedules", help="List YAML schedules")
+
+    sr = sub.add_parser("schedule-runs", help="List runs created by a YAML schedule")
+    sr.add_argument("--schedule-id", required=True)
+    sr.add_argument("--limit", type=int, default=None)
+    sr.add_argument("--records", action="store_true")
+
+    sd = sub.add_parser("schedule-delete", help="Delete a YAML schedule")
+    sd.add_argument("--schedule-id", required=True)
+
     g = sub.add_parser("get", help="Get run snapshot")
     g.add_argument("run_id")
     g.add_argument("--records", action="store_true", help="include task_records")
@@ -495,6 +513,37 @@ def main(argv: Optional[list[str]] = None) -> int:
             workflow = Path(args.workflow_file).read_text(encoding="utf-8")
             out = client.submit_run_yaml(workflow, flow_name=args.flow_name, tag=args.tag)
             _print_json(out)
+            return 0
+
+        if args.command == "schedule-yaml":
+            workflow = Path(args.workflow_file).read_text(encoding="utf-8")
+            out = client.create_yaml_schedule(
+                workflow,
+                flow_name=args.flow_name,
+                tag=args.tag,
+                run_at=args.run_at,
+                interval_seconds=args.interval_seconds,
+                start_at=args.start_at,
+            )
+            _print_json(out)
+            return 0
+
+        if args.command == "schedules":
+            _print_json(client.list_schedules())
+            return 0
+
+        if args.command == "schedule-runs":
+            _print_json(
+                client.list_schedule_runs(
+                    args.schedule_id,
+                    include_records=bool(args.records),
+                    limit=args.limit,
+                )
+            )
+            return 0
+
+        if args.command == "schedule-delete":
+            _print_json(client.delete_schedule(args.schedule_id))
             return 0
 
         if args.command == "get":

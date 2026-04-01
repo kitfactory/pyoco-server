@@ -70,6 +70,7 @@ def run_snapshot_from_context(run_ctx: RunContext, *, error: Optional[str] = Non
         "api_key_id": meta.get("api_key_id"),
         "workflow_yaml_sha256": meta.get("workflow_yaml_sha256"),
         "workflow_yaml_bytes": meta.get("workflow_yaml_bytes"),
+        "schedule_id": meta.get("schedule_id"),
         "bundle_hash": meta.get("bundle_hash"),
         "workflow_bundle_bytes": meta.get("workflow_bundle_bytes"),
         "root_run_id": meta.get("root_run_id"),
@@ -198,6 +199,7 @@ class RunJob:
     workflow_yaml: Optional[str] = None
     workflow_yaml_sha256: Optional[str] = None
     workflow_yaml_bytes: Optional[int] = None
+    schedule_id: Optional[str] = None
     workflow_bundle: Optional[str] = None
     workflow_bundle_sha256: Optional[str] = None
     workflow_bundle_bytes: Optional[int] = None

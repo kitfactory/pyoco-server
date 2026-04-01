@@ -80,7 +80,7 @@ def _load_flow_resolver(spec: str) -> Callable[[str], Flow]:
             "- hint: pyoco-worker --flow-resolver examples/hello_flow.py:resolve_flow"
         )
 
-    module_spec, attr = spec.split(":", 1)
+    module_spec, attr = spec.rsplit(":", 1)
     module_spec = module_spec.strip()
     attr = attr.strip()
     if not module_spec or not attr:
